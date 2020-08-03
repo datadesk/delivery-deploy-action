@@ -1,6 +1,7 @@
 {
   "name": "delivery-deploy-action",
   "version": "0.0.0",
+  "private": true,
   "description": "A GitHub Action for uploading a directory to S3 using @datagraphics/delivery.",
   "main": "dist/index.js",
   "scripts": {
