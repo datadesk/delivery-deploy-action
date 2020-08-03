@@ -1,0 +1,37 @@
+{
+  "name": "delivery-deploy-action",
+  "version": "0.0.0",
+  "description": "A GitHub Action for uploading a directory to S3 using @datagraphics/delivery.",
+  "main": "dist/index.js",
+  "scripts": {
+    "package": "ncc build src/index.ts --source-map",
+    "test": "echo \"No test specified\" && exit 0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/datadesk/delivery-deploy-action.git"
+  },
+  "keywords": [
+    "github-action",
+    "delivery",
+    "datagraphics",
+    "s3"
+  ],
+  "author": "Ryan Murphy <ryan.murphy@latimes.com>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/datadesk/delivery-deploy-action/issues"
+  },
+  "homepage": "https://github.com/datadesk/delivery-deploy-action#readme",
+  "dependencies": {},
+  "devDependencies": {
+    "@actions/core": "^1.2.4",
+    "@datagraphics/delivery": "^0.6.0",
+    "@datagraphics/prettier-config": "^2.0.0",
+    "@zeit/ncc": "^0.22.3",
+    "prettier": "^2.0.5",
+    "pretty-bytes": "^5.3.0",
+    "typescript": "^3.9.7"
+  },
+  "prettier": "@datagraphics/prettier-config"
+}

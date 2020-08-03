@@ -1,0 +1,28 @@
+name: "Delivery Deploy Action"
+description: "A GitHub Action for uploading a directory to S3 using @datagraphics/delivery"
+author: "Ryan Murphy"
+inputs:
+  dir:
+    description: "The directory to upload"
+    required: true
+  bucket:
+    description: "The bucket on S3 to upload the directory to"
+    required: true
+  base-path:
+    description: "An optional base path to prepend to all deployed file paths"
+    required: false
+  use-accelerate-endpoint:
+    description: "If true, the accelerated S3 endpoint will be used"
+    default: "false"
+    required: false
+  public:
+    description: "If true, the files will be uploaded with a public ACL"
+    default: "false"
+    required: false
+  should-cache:
+    description: "If true, the files will be uploaded with Delivery's cache headers"
+    default: "false"
+    required: false
+runs:
+  using: "node12"
+  main: "dist/index.js"
