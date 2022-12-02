@@ -167,7 +167,20 @@ module.exports = {
 
 /***/ }),
 /* 3 */,
-/* 4 */,
+/* 4 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+var _default = '00000000-0000-0000-0000-000000000000';
+exports.default = _default;
+
+/***/ }),
 /* 5 */,
 /* 6 */,
 /* 7 */,
@@ -180,1418 +193,9 @@ module.exports = {
 /* 14 */,
 /* 15 */,
 /* 16 */
-/***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
+/***/ (function(module) {
 
-var AWS = __webpack_require__(395);
-var v4Credentials = __webpack_require__(819);
-var resolveRegionalEndpointsFlag = __webpack_require__(232);
-var regionUtil = __webpack_require__(546);
-
-// Pull in managed upload extension
-__webpack_require__(856);
-
-/**
- * @api private
- */
-var operationsWith200StatusCodeError = {
-  'completeMultipartUpload': true,
-  'copyObject': true,
-  'uploadPartCopy': true
-};
-
-/**
- * @api private
- */
- var regionRedirectErrorCodes = [
-  'AuthorizationHeaderMalformed', // non-head operations on virtual-hosted global bucket endpoints
-  'BadRequest', // head operations on virtual-hosted global bucket endpoints
-  'PermanentRedirect', // non-head operations on path-style or regional endpoints
-  301 // head operations on path-style or regional endpoints
- ];
-
-AWS.util.update(AWS.S3.prototype, {
-  /**
-   * @api private
-   */
-  getSignatureVersion: function getSignatureVersion(request) {
-    var defaultApiVersion = this.api.signatureVersion;
-    var userDefinedVersion = this._originalConfig ? this._originalConfig.signatureVersion : null;
-    var regionDefinedVersion = this.config.signatureVersion;
-    var isPresigned = request ? request.isPresigned() : false;
-    /*
-      1) User defined version specified:
-        a) always return user defined version
-      2) No user defined version specified:
-        a) If not using presigned urls, default to V4
-        b) If using presigned urls, default to lowest version the region supports
-    */
-    if (userDefinedVersion) {
-      userDefinedVersion = userDefinedVersion === 'v2' ? 's3' : userDefinedVersion;
-      return userDefinedVersion;
-    }
-    if (isPresigned !== true) {
-      defaultApiVersion = 'v4';
-    } else if (regionDefinedVersion) {
-      defaultApiVersion = regionDefinedVersion;
-    }
-    return defaultApiVersion;
-  },
-
-  /**
-   * @api private
-   */
-  getSignerClass: function getSignerClass(request) {
-    var signatureVersion = this.getSignatureVersion(request);
-    return AWS.Signers.RequestSigner.getVersion(signatureVersion);
-  },
-
-  /**
-   * @api private
-   */
-  validateService: function validateService() {
-    var msg;
-    var messages = [];
-
-    // default to us-east-1 when no region is provided
-    if (!this.config.region) this.config.region = 'us-east-1';
-
-    if (!this.config.endpoint && this.config.s3BucketEndpoint) {
-      messages.push('An endpoint must be provided when configuring ' +
-                    '`s3BucketEndpoint` to true.');
-    }
-    if (messages.length === 1) {
-      msg = messages[0];
-    } else if (messages.length > 1) {
-      msg = 'Multiple configuration errors:\n' + messages.join('\n');
-    }
-    if (msg) {
-      throw AWS.util.error(new Error(),
-        {name: 'InvalidEndpoint', message: msg});
-    }
-  },
-
-  /**
-   * @api private
-   */
-  shouldDisableBodySigning: function shouldDisableBodySigning(request) {
-    var signerClass = this.getSignerClass();
-    if (this.config.s3DisableBodySigning === true && signerClass === AWS.Signers.V4
-        && request.httpRequest.endpoint.protocol === 'https:') {
-      return true;
-    }
-    return false;
-  },
-
-  /**
-   * @api private
-   */
-  setupRequestListeners: function setupRequestListeners(request) {
-    var prependListener = true;
-    request.addListener('validate', this.validateScheme);
-    request.addListener('validate', this.validateBucketName, prependListener);
-    request.addListener('validate', this.optInUsEast1RegionalEndpoint, prependListener);
-
-    request.removeListener('validate',
-      AWS.EventListeners.Core.VALIDATE_REGION);
-    request.addListener('build', this.addContentType);
-    request.addListener('build', this.computeContentMd5);
-    request.addListener('build', this.computeSseCustomerKeyMd5);
-    request.addListener('build', this.populateURI);
-    request.addListener('afterBuild', this.addExpect100Continue);
-    request.addListener('extractError', this.extractError);
-    request.addListener('extractData', AWS.util.hoistPayloadMember);
-    request.addListener('extractData', this.extractData);
-    request.addListener('extractData', this.extractErrorFrom200Response);
-    request.addListener('beforePresign', this.prepareSignedUrl);
-    if (this.shouldDisableBodySigning(request))  {
-      request.removeListener('afterBuild', AWS.EventListeners.Core.COMPUTE_SHA256);
-      request.addListener('afterBuild', this.disableBodySigning);
-    }
-    //deal with ARNs supplied to Bucket
-    if (this.isAccessPointApplicable(request)) {
-      request.removeListener('validate', this.validateBucketName);
-      request.addListener('validate', this.validateAccessPointArn, prependListener);
-      request.addListener('validate', this.validateArnRegion);
-      request.removeListener('build', this.populateURI);
-      request.addListener('build', this.populateUriFromAccessPoint);
-      return;
-    }
-    //listeners regarding region inference
-    request.addListener('validate', this.validateBucketEndpoint);
-    request.addListener('validate', this.correctBucketRegionFromCache);
-    request.onAsync('extractError', this.requestBucketRegion);
-    if (AWS.util.isBrowser()) {
-      request.onAsync('retry', this.reqRegionForNetworkingError);
-    }
-  },
-
-  /**
-   * @api private
-   */
-  validateScheme: function(req) {
-    var params = req.params,
-        scheme = req.httpRequest.endpoint.protocol,
-        sensitive = params.SSECustomerKey || params.CopySourceSSECustomerKey;
-    if (sensitive && scheme !== 'https:') {
-      var msg = 'Cannot send SSE keys over HTTP. Set \'sslEnabled\'' +
-        'to \'true\' in your configuration';
-      throw AWS.util.error(new Error(),
-        { code: 'ConfigError', message: msg });
-    }
-  },
-
-  /**
-   * @api private
-   */
-  validateBucketEndpoint: function(req) {
-    if (!req.params.Bucket && req.service.config.s3BucketEndpoint) {
-      var msg = 'Cannot send requests to root API with `s3BucketEndpoint` set.';
-      throw AWS.util.error(new Error(),
-        { code: 'ConfigError', message: msg });
-    }
-  },
-
-  /**
-   * @api private
-   */
-  isAccessPointApplicable: function hasBucketInParams(req) {
-    var inputShape = (req.service.api.operations[req.operation] || {}).input || {};
-    var inputMembers = inputShape.members || {};
-    if (
-      req.operation === 'createBucket' ||
-      !req.params.Bucket ||
-      !inputMembers.Bucket
-    ) return false;
-    if (!AWS.util.ARN.validate(req.params.Bucket)) return false;
-    return true;
-  },
-
-  /**
-   * Validate ARN supplied in Bucket parameter is a valid access point ARN
-   *
-   * @api private
-   */
-  validateAccessPointArn: function validateAccessPointArn(req) {
-    var parsedArn = AWS.util.ARN.parse(req.params.Bucket);
-    //avoid duplicated parsing in the future
-    req._parsedAccessPointArn = parsedArn;
-    var parsedArn = req._parsedAccessPointArn;
-    if (parsedArn.service !== 's3') {
-      throw AWS.util.error(new Error(), {
-        code: 'InvalidAccessPointARN',
-        message: 'expect \'s3\' in access point ARN service component'
-      });
-    }
-    if (!parsedArn.region) {
-      throw AWS.util.error(new Error(), {
-        code: 'InvalidAccessPointARN',
-        message: 'Access point ARN region is empty'
-      });
-    }
-    if (!/[0-9]{12}/.exec(parsedArn.accountId)) {
-      throw AWS.util.error(new Error(), {
-        code: 'InvalidAccessPointARN',
-        message: 'Access point ARN accountID does not match regex "[0-9]{12}"'
-      });
-    }
-    if (
-      parsedArn.resource.indexOf('accesspoint:') !== 0 &&
-      parsedArn.resource.indexOf('accesspoint/') !== 0
-    ) {
-      throw AWS.util.error(new Error(), {
-        code: 'InvalidAccessPointARN',
-        message: 'Access point ARN resource should begin with \'accesspoint/\''
-      });
-    }
-    var delimiter = parsedArn.resource['accesspoint'.length]; //can be ':' or '/'
-    if (parsedArn.resource.split(delimiter).length !== 2) {
-      throw AWS.util.error(new Error(), {
-        code: 'InvalidAccessPointARN',
-        message: 'Too many resource parameters in access point ARN'
-      });
-    }
-    var accessPoint = parsedArn.resource.split(delimiter)[1];
-    var accessPointPrefix = accessPoint + '-' + parsedArn.accountId;
-    if (!req.service.dnsCompatibleBucketName(accessPointPrefix) || accessPointPrefix.match(/\./)) {
-      throw AWS.util.error(new Error(), {
-        code: 'InvalidAccessPointARN',
-        message: 'Access point ARN is not DNS compatible. Got ' + accessPoint
-      });
-    }
-    //set parsed valid access point
-    req._parsedAccessPointArn.accessPoint = accessPoint;
-  },
-
-  /**
-   * @api private
-   */
-  validateArnRegion: function validateArnRegion(req) {
-    var useArnRegion = req.service.loadUseArnRegionConfig(req);
-    var regionFromArn = req._parsedAccessPointArn.region;
-    var clientRegion = req.service.config.region;
-    if (
-      clientRegion.indexOf('fips') >= 0 ||
-      regionFromArn.indexOf('fips') >= 0
-    ) {
-      throw AWS.util.error(new Error(), {
-        code: 'InvalidConfiguration',
-        message: 'Access point endpoint is not compatible with FIPS region'
-      });
-    }
-    if (!useArnRegion && regionFromArn !== clientRegion) {
-      throw AWS.util.error(new Error(), {
-        code: 'InvalidConfiguration',
-        message: 'Configured region conflicts with access point region'
-      });
-    } else if (
-      useArnRegion &&
-      regionUtil.getEndpointSuffix(regionFromArn) !== regionUtil.getEndpointSuffix(clientRegion)
-    ) {
-      throw AWS.util.error(new Error(), {
-        code: 'InvalidConfiguration',
-        message: 'Configured region and access point region not in same partition'
-      });
-    }
-    if (req.service.config.useAccelerateEndpoint) {
-      throw AWS.util.error(new Error(), {
-        code: 'InvalidConfiguration',
-        message: 'useAccelerateEndpoint config is not supported with access point ARN'
-      });
-    }
-  },
-
-  /**
-   * @api private
-   */
-  loadUseArnRegionConfig: function loadUseArnRegionConfig(req) {
-    var envName = 'AWS_S3_USE_ARN_REGION';
-    var configName = 's3_use_arn_region';
-    var useArnRegion = true;
-    var originalConfig = req.service._originalConfig || {};
-    if (req.service.config.s3UseArnRegion !== undefined) {
-      return req.service.config.s3UseArnRegion;
-    } else if (originalConfig.s3UseArnRegion !== undefined) {
-      useArnRegion = originalConfig.s3UseArnRegion === true;
-    } else if (AWS.util.isNode()) {
-      //load from environmental variable AWS_USE_ARN_REGION
-      if (process.env[envName]) {
-        var value = process.env[envName].trim().toLowerCase();
-        if (['false', 'true'].indexOf(value) < 0) {
-          throw AWS.util.error(new Error(), {
-            code: 'InvalidConfiguration',
-            message: envName + ' only accepts true or false. Got ' + process.env[envName],
-            retryable: false
-          });
-        }
-        useArnRegion = value === 'true';
-      } else {  //load from shared config property use_arn_region
-        var profiles = {};
-        var profile = {};
-        try {
-          profiles = AWS.util.getProfilesFromSharedConfig(AWS.util.iniLoader);
-          profile = profiles[process.env.AWS_PROFILE || AWS.util.defaultProfile];
-        } catch (e) {}
-        if (profile[configName]) {
-          if (['false', 'true'].indexOf(profile[configName].trim().toLowerCase()) < 0) {
-            throw AWS.util.error(new Error(), {
-              code: 'InvalidConfiguration',
-              message: configName + ' only accepts true or false. Got ' + profile[configName],
-              retryable: false
-            });
-          }
-          useArnRegion = profile[configName].trim().toLowerCase() === 'true';
-        }
-      }
-    }
-    req.service.config.s3UseArnRegion = useArnRegion;
-    return useArnRegion;
-  },
-
-  /**
-   * @api private
-   */
-  validateBucketName: function validateBucketName(req) {
-    var service = req.service;
-    var signatureVersion = service.getSignatureVersion(req);
-    var bucket = req.params && req.params.Bucket;
-    var key = req.params && req.params.Key;
-    var slashIndex = bucket && bucket.indexOf('/');
-    if (bucket && slashIndex >= 0) {
-      if (typeof key === 'string' && slashIndex > 0) {
-        req.params = AWS.util.copy(req.params);
-        // Need to include trailing slash to match sigv2 behavior
-        var prefix = bucket.substr(slashIndex + 1) || '';
-        req.params.Key = prefix + '/' + key;
-        req.params.Bucket = bucket.substr(0, slashIndex);
-      } else if (signatureVersion === 'v4') {
-        var msg = 'Bucket names cannot contain forward slashes. Bucket: ' + bucket;
-        throw AWS.util.error(new Error(),
-          { code: 'InvalidBucket', message: msg });
-      }
-    }
-  },
-
-  /**
-   * @api private
-   */
-  isValidAccelerateOperation: function isValidAccelerateOperation(operation) {
-    var invalidOperations = [
-      'createBucket',
-      'deleteBucket',
-      'listBuckets'
-    ];
-    return invalidOperations.indexOf(operation) === -1;
-  },
-
-  /**
-   * When us-east-1 region endpoint configuration is set, in stead of sending request to
-   * global endpoint(e.g. 's3.amazonaws.com'), we will send request to
-   * 's3.us-east-1.amazonaws.com'.
-   * @api private
-   */
-  optInUsEast1RegionalEndpoint: function optInUsEast1RegionalEndpoint(req) {
-    var service = req.service;
-    var config = service.config;
-    config.s3UsEast1RegionalEndpoint = resolveRegionalEndpointsFlag(service._originalConfig, {
-      env: 'AWS_S3_US_EAST_1_REGIONAL_ENDPOINT',
-      sharedConfig: 's3_us_east_1_regional_endpoint',
-      clientConfig: 's3UsEast1RegionalEndpoint'
-    });
-    if (
-      !(service._originalConfig || {}).endpoint &&
-      req.httpRequest.region === 'us-east-1' &&
-      config.s3UsEast1RegionalEndpoint === 'regional' &&
-      req.httpRequest.endpoint.hostname.indexOf('s3.amazonaws.com') >= 0
-    ) {
-      var insertPoint = config.endpoint.indexOf('.amazonaws.com');
-      regionalEndpoint = config.endpoint.substring(0, insertPoint) +
-        '.us-east-1' + config.endpoint.substring(insertPoint);
-      req.httpRequest.updateEndpoint(regionalEndpoint);
-    }
-  },
-
-  /**
-   * S3 prefers dns-compatible bucket names to be moved from the uri path
-   * to the hostname as a sub-domain.  This is not possible, even for dns-compat
-   * buckets when using SSL and the bucket name contains a dot ('.').  The
-   * ssl wildcard certificate is only 1-level deep.
-   *
-   * @api private
-   */
-  populateURI: function populateURI(req) {
-    var httpRequest = req.httpRequest;
-    var b = req.params.Bucket;
-    var service = req.service;
-    var endpoint = httpRequest.endpoint;
-    if (b) {
-      if (!service.pathStyleBucketName(b)) {
-        if (service.config.useAccelerateEndpoint && service.isValidAccelerateOperation(req.operation)) {
-          if (service.config.useDualstack) {
-            endpoint.hostname = b + '.s3-accelerate.dualstack.amazonaws.com';
-          } else {
-            endpoint.hostname = b + '.s3-accelerate.amazonaws.com';
-          }
-        } else if (!service.config.s3BucketEndpoint) {
-          endpoint.hostname =
-            b + '.' + endpoint.hostname;
-        }
-
-        var port = endpoint.port;
-        if (port !== 80 && port !== 443) {
-          endpoint.host = endpoint.hostname + ':' +
-            endpoint.port;
-        } else {
-          endpoint.host = endpoint.hostname;
-        }
-
-        httpRequest.virtualHostedBucket = b; // needed for signing the request
-        service.removeVirtualHostedBucketFromPath(req);
-      }
-    }
-  },
-
-  /**
-   * Takes the bucket name out of the path if bucket is virtual-hosted
-   *
-   * @api private
-   */
-  removeVirtualHostedBucketFromPath: function removeVirtualHostedBucketFromPath(req) {
-    var httpRequest = req.httpRequest;
-    var bucket = httpRequest.virtualHostedBucket;
-    if (bucket && httpRequest.path) {
-      if (req.params && req.params.Key) {
-        var encodedS3Key = '/' + AWS.util.uriEscapePath(req.params.Key);
-        if (httpRequest.path.indexOf(encodedS3Key) === 0 && (httpRequest.path.length === encodedS3Key.length || httpRequest.path[encodedS3Key.length] === '?')) {
-          //path only contains key or path contains only key and querystring
-          return;
-        }
-      }
-      httpRequest.path = httpRequest.path.replace(new RegExp('/' + bucket), '');
-      if (httpRequest.path[0] !== '/') {
-        httpRequest.path = '/' + httpRequest.path;
-      }
-    }
-  },
-
-  /**
-   * When user supply an access point ARN in the Bucket parameter, we need to
-   * populate the URI according to the ARN.
-   * @api private
-   */
-  populateUriFromAccessPoint: function populateUriFromAccessPoint(req) {
-    if (req.service._originalConfig && req.service._originalConfig.endpoint) {
-      throw AWS.util.error(new Error(), {
-        code: 'InvalidConfiguration',
-        message: 'Custom endpoint is not compatible with access point ARN'
-      });
-    }
-    if (req.service.config.s3ForcePathStyle) {
-      throw AWS.util.error(new Error(), {
-        code: 'InvalidConfiguration',
-        message: 'Cannot construct path-style endpoint with access point'
-      });
-    }
-    var accessPointArn = req._parsedAccessPointArn;
-    var serviceName = req.service.config.useDualstack ?
-      's3-accesspoint.dualstack':
-      's3-accesspoint';
-    var endpoint = req.httpRequest.endpoint;
-    var dnsSuffix = regionUtil.getEndpointSuffix(accessPointArn.region);
-    var useArnRegion = req.service.config.s3UseArnRegion;
-    endpoint.hostname = [
-      accessPointArn.accessPoint + '-' + accessPointArn.accountId,
-      serviceName,
-      useArnRegion ? accessPointArn.region : req.service.config.region,
-      dnsSuffix
-    ].join('.');
-    endpoint.host = endpoint.hostname;
-    var encodedArn = AWS.util.uriEscape(req.params.Bucket);
-    var path = req.httpRequest.path;
-    //remove the Bucket value from path
-    req.httpRequest.path = path.replace(new RegExp('/' + encodedArn), '');
-    if (req.httpRequest.path[0] !== '/') {
-      req.httpRequest.path = '/' + req.httpRequest.path;
-    }
-    req.httpRequest.region = accessPointArn.region; //region used to sign
-  },
-
-  /**
-   * Adds Expect: 100-continue header if payload is greater-or-equal 1MB
-   * @api private
-   */
-  addExpect100Continue: function addExpect100Continue(req) {
-    var len = req.httpRequest.headers['Content-Length'];
-    if (AWS.util.isNode() && (len >= 1024 * 1024 || req.params.Body instanceof AWS.util.stream.Stream)) {
-      req.httpRequest.headers['Expect'] = '100-continue';
-    }
-  },
-
-  /**
-   * Adds a default content type if none is supplied.
-   *
-   * @api private
-   */
-  addContentType: function addContentType(req) {
-    var httpRequest = req.httpRequest;
-    if (httpRequest.method === 'GET' || httpRequest.method === 'HEAD') {
-      // Content-Type is not set in GET/HEAD requests
-      delete httpRequest.headers['Content-Type'];
-      return;
-    }
-
-    if (!httpRequest.headers['Content-Type']) { // always have a Content-Type
-      httpRequest.headers['Content-Type'] = 'application/octet-stream';
-    }
-
-    var contentType = httpRequest.headers['Content-Type'];
-    if (AWS.util.isBrowser()) {
-      if (typeof httpRequest.body === 'string' && !contentType.match(/;\s*charset=/)) {
-        var charset = '; charset=UTF-8';
-        httpRequest.headers['Content-Type'] += charset;
-      } else {
-        var replaceFn = function(_, prefix, charsetName) {
-          return prefix + charsetName.toUpperCase();
-        };
-
-        httpRequest.headers['Content-Type'] =
-          contentType.replace(/(;\s*charset=)(.+)$/, replaceFn);
-      }
-    }
-  },
-
-  /**
-   * @api private
-   */
-  computableChecksumOperations: {
-    putBucketCors: true,
-    putBucketLifecycle: true,
-    putBucketLifecycleConfiguration: true,
-    putBucketTagging: true,
-    deleteObjects: true,
-    putBucketReplication: true,
-    putObjectLegalHold: true,
-    putObjectRetention: true,
-    putObjectLockConfiguration: true
-  },
-
-  /**
-   * Checks whether checksums should be computed for the request.
-   * If the request requires checksums to be computed, this will always
-   * return true, otherwise it depends on whether {AWS.Config.computeChecksums}
-   * is set.
-   *
-   * @param req [AWS.Request] the request to check against
-   * @return [Boolean] whether to compute checksums for a request.
-   * @api private
-   */
-  willComputeChecksums: function willComputeChecksums(req) {
-    if (this.computableChecksumOperations[req.operation]) return true;
-    if (!this.config.computeChecksums) return false;
-
-    // TODO: compute checksums for Stream objects
-    if (!AWS.util.Buffer.isBuffer(req.httpRequest.body) &&
-        typeof req.httpRequest.body !== 'string') {
-      return false;
-    }
-
-    var rules = req.service.api.operations[req.operation].input.members;
-
-    // Sha256 signing disabled, and not a presigned url
-    if (req.service.shouldDisableBodySigning(req) && !Object.prototype.hasOwnProperty.call(req.httpRequest.headers, 'presigned-expires')) {
-      if (rules.ContentMD5 && !req.params.ContentMD5) {
-        return true;
-      }
-    }
-
-    // V4 signer uses SHA256 signatures so only compute MD5 if it is required
-    if (req.service.getSignerClass(req) === AWS.Signers.V4) {
-      if (rules.ContentMD5 && !rules.ContentMD5.required) return false;
-    }
-
-    if (rules.ContentMD5 && !req.params.ContentMD5) return true;
-  },
-
-  /**
-   * A listener that computes the Content-MD5 and sets it in the header.
-   * @see AWS.S3.willComputeChecksums
-   * @api private
-   */
-  computeContentMd5: function computeContentMd5(req) {
-    if (req.service.willComputeChecksums(req)) {
-      var md5 = AWS.util.crypto.md5(req.httpRequest.body, 'base64');
-      req.httpRequest.headers['Content-MD5'] = md5;
-    }
-  },
-
-  /**
-   * @api private
-   */
-  computeSseCustomerKeyMd5: function computeSseCustomerKeyMd5(req) {
-    var keys = {
-      SSECustomerKey: 'x-amz-server-side-encryption-customer-key-MD5',
-      CopySourceSSECustomerKey: 'x-amz-copy-source-server-side-encryption-customer-key-MD5'
-    };
-    AWS.util.each(keys, function(key, header) {
-      if (req.params[key]) {
-        var value = AWS.util.crypto.md5(req.params[key], 'base64');
-        req.httpRequest.headers[header] = value;
-      }
-    });
-  },
-
-  /**
-   * Returns true if the bucket name should be left in the URI path for
-   * a request to S3.  This function takes into account the current
-   * endpoint protocol (e.g. http or https).
-   *
-   * @api private
-   */
-  pathStyleBucketName: function pathStyleBucketName(bucketName) {
-    // user can force path style requests via the configuration
-    if (this.config.s3ForcePathStyle) return true;
-    if (this.config.s3BucketEndpoint) return false;
-
-    if (this.dnsCompatibleBucketName(bucketName)) {
-      return (this.config.sslEnabled && bucketName.match(/\./)) ? true : false;
-    } else {
-      return true; // not dns compatible names must always use path style
-    }
-  },
-
-  /**
-   * Returns true if the bucket name is DNS compatible.  Buckets created
-   * outside of the classic region MUST be DNS compatible.
-   *
-   * @api private
-   */
-  dnsCompatibleBucketName: function dnsCompatibleBucketName(bucketName) {
-    var b = bucketName;
-    var domain = new RegExp(/^[a-z0-9][a-z0-9\.\-]{1,61}[a-z0-9]$/);
-    var ipAddress = new RegExp(/(\d+\.){3}\d+/);
-    var dots = new RegExp(/\.\./);
-    return (b.match(domain) && !b.match(ipAddress) && !b.match(dots)) ? true : false;
-  },
-
-  /**
-   * For COPY operations, some can be error even with status code 200.
-   * SDK treats the response as exception when response body indicates
-   * an exception or body is empty.
-   *
-   * @api private
-   */
-  extractErrorFrom200Response: function extractErrorFrom200Response(resp) {
-    if (!operationsWith200StatusCodeError[resp.request.operation]) return;
-    var httpResponse = resp.httpResponse;
-    if (httpResponse.body && httpResponse.body.toString().match('<Error>')) {
-      // Response body with '<Error>...</Error>' indicates an exception.
-      // Get S3 client object. In ManagedUpload, this.service refers to
-      // S3 client object.
-      resp.data = null;
-      var service = this.service ? this.service : this;
-      service.extractError(resp);
-      throw resp.error;
-    } else if (!httpResponse.body || !httpResponse.body.toString().match(/<[\w_]/)) {
-      // When body is empty or incomplete, S3 might stop the request on detecting client
-      // side aborting the request.
-      resp.data = null;
-      throw AWS.util.error(new Error(), {
-        code: 'InternalError',
-        message: 'S3 aborted request'
-      });
-    }
-  },
-
-  /**
-   * @return [Boolean] whether the error can be retried
-   * @api private
-   */
-  retryableError: function retryableError(error, request) {
-    if (operationsWith200StatusCodeError[request.operation] &&
-        error.statusCode === 200) {
-      return true;
-    } else if (request._requestRegionForBucket &&
-        request.service.bucketRegionCache[request._requestRegionForBucket]) {
-      return false;
-    } else if (error && error.code === 'RequestTimeout') {
-      return true;
-    } else if (error &&
-        regionRedirectErrorCodes.indexOf(error.code) != -1 &&
-        error.region && error.region != request.httpRequest.region) {
-      request.httpRequest.region = error.region;
-      if (error.statusCode === 301) {
-        request.service.updateReqBucketRegion(request);
-      }
-      return true;
-    } else {
-      var _super = AWS.Service.prototype.retryableError;
-      return _super.call(this, error, request);
-    }
-  },
-
-  /**
-   * Updates httpRequest with region. If region is not provided, then
-   * the httpRequest will be updated based on httpRequest.region
-   *
-   * @api private
-   */
-  updateReqBucketRegion: function updateReqBucketRegion(request, region) {
-    var httpRequest = request.httpRequest;
-    if (typeof region === 'string' && region.length) {
-      httpRequest.region = region;
-    }
-    if (!httpRequest.endpoint.host.match(/s3(?!-accelerate).*\.amazonaws\.com$/)) {
-      return;
-    }
-    var service = request.service;
-    var s3Config = service.config;
-    var s3BucketEndpoint = s3Config.s3BucketEndpoint;
-    if (s3BucketEndpoint) {
-      delete s3Config.s3BucketEndpoint;
-    }
-    var newConfig = AWS.util.copy(s3Config);
-    delete newConfig.endpoint;
-    newConfig.region = httpRequest.region;
-
-    httpRequest.endpoint = (new AWS.S3(newConfig)).endpoint;
-    service.populateURI(request);
-    s3Config.s3BucketEndpoint = s3BucketEndpoint;
-    httpRequest.headers.Host = httpRequest.endpoint.host;
-
-    if (request._asm.currentState === 'validate') {
-      request.removeListener('build', service.populateURI);
-      request.addListener('build', service.removeVirtualHostedBucketFromPath);
-    }
-  },
-
-  /**
-   * Provides a specialized parser for getBucketLocation -- all other
-   * operations are parsed by the super class.
-   *
-   * @api private
-   */
-  extractData: function extractData(resp) {
-    var req = resp.request;
-    if (req.operation === 'getBucketLocation') {
-      var match = resp.httpResponse.body.toString().match(/>(.+)<\/Location/);
-      delete resp.data['_'];
-      if (match) {
-        resp.data.LocationConstraint = match[1];
-      } else {
-        resp.data.LocationConstraint = '';
-      }
-    }
-    var bucket = req.params.Bucket || null;
-    if (req.operation === 'deleteBucket' && typeof bucket === 'string' && !resp.error) {
-      req.service.clearBucketRegionCache(bucket);
-    } else {
-      var headers = resp.httpResponse.headers || {};
-      var region = headers['x-amz-bucket-region'] || null;
-      if (!region && req.operation === 'createBucket' && !resp.error) {
-        var createBucketConfiguration = req.params.CreateBucketConfiguration;
-        if (!createBucketConfiguration) {
-          region = 'us-east-1';
-        } else if (createBucketConfiguration.LocationConstraint === 'EU') {
-          region = 'eu-west-1';
-        } else {
-          region = createBucketConfiguration.LocationConstraint;
-        }
-      }
-      if (region) {
-          if (bucket && region !== req.service.bucketRegionCache[bucket]) {
-            req.service.bucketRegionCache[bucket] = region;
-          }
-      }
-    }
-    req.service.extractRequestIds(resp);
-  },
-
-  /**
-   * Extracts an error object from the http response.
-   *
-   * @api private
-   */
-  extractError: function extractError(resp) {
-    var codes = {
-      304: 'NotModified',
-      403: 'Forbidden',
-      400: 'BadRequest',
-      404: 'NotFound'
-    };
-
-    var req = resp.request;
-    var code = resp.httpResponse.statusCode;
-    var body = resp.httpResponse.body || '';
-
-    var headers = resp.httpResponse.headers || {};
-    var region = headers['x-amz-bucket-region'] || null;
-    var bucket = req.params.Bucket || null;
-    var bucketRegionCache = req.service.bucketRegionCache;
-    if (region && bucket && region !== bucketRegionCache[bucket]) {
-      bucketRegionCache[bucket] = region;
-    }
-
-    var cachedRegion;
-    if (codes[code] && body.length === 0) {
-      if (bucket && !region) {
-        cachedRegion = bucketRegionCache[bucket] || null;
-        if (cachedRegion !== req.httpRequest.region) {
-          region = cachedRegion;
-        }
-      }
-      resp.error = AWS.util.error(new Error(), {
-        code: codes[code],
-        message: null,
-        region: region
-      });
-    } else {
-      var data = new AWS.XML.Parser().parse(body.toString());
-
-      if (data.Region && !region) {
-        region = data.Region;
-        if (bucket && region !== bucketRegionCache[bucket]) {
-          bucketRegionCache[bucket] = region;
-        }
-      } else if (bucket && !region && !data.Region) {
-        cachedRegion = bucketRegionCache[bucket] || null;
-        if (cachedRegion !== req.httpRequest.region) {
-          region = cachedRegion;
-        }
-      }
-
-      resp.error = AWS.util.error(new Error(), {
-        code: data.Code || code,
-        message: data.Message || null,
-        region: region
-      });
-    }
-    req.service.extractRequestIds(resp);
-  },
-
-  /**
-   * If region was not obtained synchronously, then send async request
-   * to get bucket region for errors resulting from wrong region.
-   *
-   * @api private
-   */
-  requestBucketRegion: function requestBucketRegion(resp, done) {
-    var error = resp.error;
-    var req = resp.request;
-    var bucket = req.params.Bucket || null;
-
-    if (!error || !bucket || error.region || req.operation === 'listObjects' ||
-        (AWS.util.isNode() && req.operation === 'headBucket') ||
-        (error.statusCode === 400 && req.operation !== 'headObject') ||
-        regionRedirectErrorCodes.indexOf(error.code) === -1) {
-      return done();
-    }
-    var reqOperation = AWS.util.isNode() ? 'headBucket' : 'listObjects';
-    var reqParams = {Bucket: bucket};
-    if (reqOperation === 'listObjects') reqParams.MaxKeys = 0;
-    var regionReq = req.service[reqOperation](reqParams);
-    regionReq._requestRegionForBucket = bucket;
-    regionReq.send(function() {
-      var region = req.service.bucketRegionCache[bucket] || null;
-      error.region = region;
-      done();
-    });
-  },
-
-   /**
-   * For browser only. If NetworkingError received, will attempt to obtain
-   * the bucket region.
-   *
-   * @api private
-   */
-   reqRegionForNetworkingError: function reqRegionForNetworkingError(resp, done) {
-    if (!AWS.util.isBrowser()) {
-      return done();
-    }
-    var error = resp.error;
-    var request = resp.request;
-    var bucket = request.params.Bucket;
-    if (!error || error.code !== 'NetworkingError' || !bucket ||
-        request.httpRequest.region === 'us-east-1') {
-      return done();
-    }
-    var service = request.service;
-    var bucketRegionCache = service.bucketRegionCache;
-    var cachedRegion = bucketRegionCache[bucket] || null;
-
-    if (cachedRegion && cachedRegion !== request.httpRequest.region) {
-      service.updateReqBucketRegion(request, cachedRegion);
-      done();
-    } else if (!service.dnsCompatibleBucketName(bucket)) {
-      service.updateReqBucketRegion(request, 'us-east-1');
-      if (bucketRegionCache[bucket] !== 'us-east-1') {
-        bucketRegionCache[bucket] = 'us-east-1';
-      }
-      done();
-    } else if (request.httpRequest.virtualHostedBucket) {
-      var getRegionReq = service.listObjects({Bucket: bucket, MaxKeys: 0});
-      service.updateReqBucketRegion(getRegionReq, 'us-east-1');
-      getRegionReq._requestRegionForBucket = bucket;
-
-      getRegionReq.send(function() {
-        var region = service.bucketRegionCache[bucket] || null;
-        if (region && region !== request.httpRequest.region) {
-          service.updateReqBucketRegion(request, region);
-        }
-        done();
-      });
-    } else {
-      // DNS-compatible path-style
-      // (s3ForcePathStyle or bucket name with dot over https)
-      // Cannot obtain region information for this case
-      done();
-    }
-   },
-
-  /**
-   * Cache for bucket region.
-   *
-   * @api private
-   */
-   bucketRegionCache: {},
-
-  /**
-   * Clears bucket region cache.
-   *
-   * @api private
-   */
-   clearBucketRegionCache: function(buckets) {
-    var bucketRegionCache = this.bucketRegionCache;
-    if (!buckets) {
-      buckets = Object.keys(bucketRegionCache);
-    } else if (typeof buckets === 'string') {
-      buckets = [buckets];
-    }
-    for (var i = 0; i < buckets.length; i++) {
-      delete bucketRegionCache[buckets[i]];
-    }
-    return bucketRegionCache;
-   },
-
-   /**
-    * Corrects request region if bucket's cached region is different
-    *
-    * @api private
-    */
-  correctBucketRegionFromCache: function correctBucketRegionFromCache(req) {
-    var bucket = req.params.Bucket || null;
-    if (bucket) {
-      var service = req.service;
-      var requestRegion = req.httpRequest.region;
-      var cachedRegion = service.bucketRegionCache[bucket];
-      if (cachedRegion && cachedRegion !== requestRegion) {
-        service.updateReqBucketRegion(req, cachedRegion);
-      }
-    }
-  },
-
-  /**
-   * Extracts S3 specific request ids from the http response.
-   *
-   * @api private
-   */
-  extractRequestIds: function extractRequestIds(resp) {
-    var extendedRequestId = resp.httpResponse.headers ? resp.httpResponse.headers['x-amz-id-2'] : null;
-    var cfId = resp.httpResponse.headers ? resp.httpResponse.headers['x-amz-cf-id'] : null;
-    resp.extendedRequestId = extendedRequestId;
-    resp.cfId = cfId;
-
-    if (resp.error) {
-      resp.error.requestId = resp.requestId || null;
-      resp.error.extendedRequestId = extendedRequestId;
-      resp.error.cfId = cfId;
-    }
-  },
-
-  /**
-   * Get a pre-signed URL for a given operation name.
-   *
-   * @note You must ensure that you have static or previously resolved
-   *   credentials if you call this method synchronously (with no callback),
-   *   otherwise it may not properly sign the request. If you cannot guarantee
-   *   this (you are using an asynchronous credential provider, i.e., EC2
-   *   IAM roles), you should always call this method with an asynchronous
-   *   callback.
-   * @note Not all operation parameters are supported when using pre-signed
-   *   URLs. Certain parameters, such as `SSECustomerKey`, `ACL`, `Expires`,
-   *   `ContentLength`, or `Tagging` must be provided as headers when sending a
-   *   request. If you are using pre-signed URLs to upload from a browser and
-   *   need to use these fields, see {createPresignedPost}.
-   * @note The default signer allows altering the request by adding corresponding
-   *   headers to set some parameters (e.g. Range) and these added parameters
-   *   won't be signed. You must use signatureVersion v4 to to include these
-   *   parameters in the signed portion of the URL and enforce exact matching
-   *   between headers and signed params in the URL.
-   * @note This operation cannot be used with a promise. See note above regarding
-   *   asynchronous credentials and use with a callback.
-   * @param operation [String] the name of the operation to call
-   * @param params [map] parameters to pass to the operation. See the given
-   *   operation for the expected operation parameters. In addition, you can
-   *   also pass the "Expires" parameter to inform S3 how long the URL should
-   *   work for.
-   * @option params Expires [Integer] (900) the number of seconds to expire
-   *   the pre-signed URL operation in. Defaults to 15 minutes.
-   * @param callback [Function] if a callback is provided, this function will
-   *   pass the URL as the second parameter (after the error parameter) to
-   *   the callback function.
-   * @return [String] if called synchronously (with no callback), returns the
-   *   signed URL.
-   * @return [null] nothing is returned if a callback is provided.
-   * @example Pre-signing a getObject operation (synchronously)
-   *   var params = {Bucket: 'bucket', Key: 'key'};
-   *   var url = s3.getSignedUrl('getObject', params);
-   *   console.log('The URL is', url);
-   * @example Pre-signing a putObject (asynchronously)
-   *   var params = {Bucket: 'bucket', Key: 'key'};
-   *   s3.getSignedUrl('putObject', params, function (err, url) {
-   *     console.log('The URL is', url);
-   *   });
-   * @example Pre-signing a putObject operation with a specific payload
-   *   var params = {Bucket: 'bucket', Key: 'key', Body: 'body'};
-   *   var url = s3.getSignedUrl('putObject', params);
-   *   console.log('The URL is', url);
-   * @example Passing in a 1-minute expiry time for a pre-signed URL
-   *   var params = {Bucket: 'bucket', Key: 'key', Expires: 60};
-   *   var url = s3.getSignedUrl('getObject', params);
-   *   console.log('The URL is', url); // expires in 60 seconds
-   */
-  getSignedUrl: function getSignedUrl(operation, params, callback) {
-    params = AWS.util.copy(params || {});
-    var expires = params.Expires || 900;
-
-    if (typeof expires !== 'number') {
-      throw AWS.util.error(new Error(),
-        { code: 'InvalidParameterException', message: 'The expiration must be a number, received ' + typeof expires });
-    }
-
-    delete params.Expires; // we can't validate this
-    var request = this.makeRequest(operation, params);
-
-    if (callback) {
-      AWS.util.defer(function() {
-        request.presign(expires, callback);
-      });
-    } else {
-      return request.presign(expires, callback);
-    }
-  },
-
-  /**
-   * @!method  getSignedUrlPromise()
-   *   Returns a 'thenable' promise that will be resolved with a pre-signed URL
-   *   for a given operation name.
-   *
-   *   Two callbacks can be provided to the `then` method on the returned promise.
-   *   The first callback will be called if the promise is fulfilled, and the second
-   *   callback will be called if the promise is rejected.
-   *   @note Not all operation parameters are supported when using pre-signed
-   *      URLs. Certain parameters, such as `SSECustomerKey`, `ACL`, `Expires`,
-   *      `ContentLength`, or `Tagging` must be provided as headers when sending a
-   *      request. If you are using pre-signed URLs to upload from a browser and
-   *      need to use these fields, see {createPresignedPost}.
-   *   @param operation [String] the name of the operation to call
-   *   @param params [map] parameters to pass to the operation. See the given
-   *      operation for the expected operation parameters. In addition, you can
-   *      also pass the "Expires" parameter to inform S3 how long the URL should
-   *      work for.
-   *   @option params Expires [Integer] (900) the number of seconds to expire
-   *      the pre-signed URL operation in. Defaults to 15 minutes.
-   *   @callback fulfilledCallback function(url)
-   *     Called if the promise is fulfilled.
-   *     @param url [String] the signed url
-   *   @callback rejectedCallback function(err)
-   *     Called if the promise is rejected.
-   *     @param err [Error] if an error occurred, this value will be filled
-   *   @return [Promise] A promise that represents the state of the `refresh` call.
-   *   @example Pre-signing a getObject operation
-   *      var params = {Bucket: 'bucket', Key: 'key'};
-   *      var promise = s3.getSignedUrlPromise('getObject', params);
-   *      promise.then(function(url) {
-   *        console.log('The URL is', url);
-   *      }, function(err) { ... });
-   *   @example Pre-signing a putObject operation with a specific payload
-   *      var params = {Bucket: 'bucket', Key: 'key', Body: 'body'};
-   *      var promise = s3.getSignedUrlPromise('putObject', params);
-   *      promise.then(function(url) {
-   *        console.log('The URL is', url);
-   *      }, function(err) { ... });
-   *   @example Passing in a 1-minute expiry time for a pre-signed URL
-   *      var params = {Bucket: 'bucket', Key: 'key', Expires: 60};
-   *      var promise = s3.getSignedUrlPromise('getObject', params);
-   *      promise.then(function(url) {
-   *        console.log('The URL is', url);
-   *      }, function(err) { ... });
-   */
-
-  /**
-   * Get a pre-signed POST policy to support uploading to S3 directly from an
-   * HTML form.
-   *
-   * @param params [map]
-   * @option params Bucket [String]     The bucket to which the post should be
-   *                                    uploaded
-   * @option params Expires [Integer]   (3600) The number of seconds for which
-   *                                    the presigned policy should be valid.
-   * @option params Conditions [Array]  An array of conditions that must be met
-   *                                    for the presigned policy to allow the
-   *                                    upload. This can include required tags,
-   *                                    the accepted range for content lengths,
-   *                                    etc.
-   * @see http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html
-   * @option params Fields [map]        Fields to include in the form. All
-   *                                    values passed in as fields will be
-   *                                    signed as exact match conditions.
-   * @param callback [Function]
-   *
-   * @note All fields passed in when creating presigned post data will be signed
-   *   as exact match conditions. Any fields that will be interpolated by S3
-   *   must be added to the fields hash after signing, and an appropriate
-   *   condition for such fields must be explicitly added to the Conditions
-   *   array passed to this function before signing.
-   *
-   * @example Presiging post data with a known key
-   *   var params = {
-   *     Bucket: 'bucket',
-   *     Fields: {
-   *       key: 'key'
-   *     }
-   *   };
-   *   s3.createPresignedPost(params, function(err, data) {
-   *     if (err) {
-   *       console.error('Presigning post data encountered an error', err);
-   *     } else {
-   *       console.log('The post data is', data);
-   *     }
-   *   });
-   *
-   * @example Presigning post data with an interpolated key
-   *   var params = {
-   *     Bucket: 'bucket',
-   *     Conditions: [
-   *       ['starts-with', '$key', 'path/to/uploads/']
-   *     ]
-   *   };
-   *   s3.createPresignedPost(params, function(err, data) {
-   *     if (err) {
-   *       console.error('Presigning post data encountered an error', err);
-   *     } else {
-   *       data.Fields.key = 'path/to/uploads/${filename}';
-   *       console.log('The post data is', data);
-   *     }
-   *   });
-   *
-   * @note You must ensure that you have static or previously resolved
-   *   credentials if you call this method synchronously (with no callback),
-   *   otherwise it may not properly sign the request. If you cannot guarantee
-   *   this (you are using an asynchronous credential provider, i.e., EC2
-   *   IAM roles), you should always call this method with an asynchronous
-   *   callback.
-   *
-   * @return [map]  If called synchronously (with no callback), returns a hash
-   *                with the url to set as the form action and a hash of fields
-   *                to include in the form.
-   * @return [null] Nothing is returned if a callback is provided.
-   *
-   * @callback callback function (err, data)
-   *  @param err [Error] the error object returned from the policy signer
-   *  @param data [map] The data necessary to construct an HTML form
-   *  @param data.url [String] The URL to use as the action of the form
-   *  @param data.fields [map] A hash of fields that must be included in the
-   *                           form for the upload to succeed. This hash will
-   *                           include the signed POST policy, your access key
-   *                           ID and security token (if present), etc. These
-   *                           may be safely included as input elements of type
-   *                           'hidden.'
-   */
-  createPresignedPost: function createPresignedPost(params, callback) {
-    if (typeof params === 'function' && callback === undefined) {
-      callback = params;
-      params = null;
-    }
-
-    params = AWS.util.copy(params || {});
-    var boundParams = this.config.params || {};
-    var bucket = params.Bucket || boundParams.Bucket,
-      self = this,
-      config = this.config,
-      endpoint = AWS.util.copy(this.endpoint);
-    if (!config.s3BucketEndpoint) {
-      endpoint.pathname = '/' + bucket;
-    }
-
-    function finalizePost() {
-      return {
-        url: AWS.util.urlFormat(endpoint),
-        fields: self.preparePostFields(
-          config.credentials,
-          config.region,
-          bucket,
-          params.Fields,
-          params.Conditions,
-          params.Expires
-        )
-      };
-    }
-
-    if (callback) {
-      config.getCredentials(function (err) {
-        if (err) {
-          callback(err);
-        }
-
-        callback(null, finalizePost());
-      });
-    } else {
-      return finalizePost();
-    }
-  },
-
-  /**
-   * @api private
-   */
-  preparePostFields: function preparePostFields(
-    credentials,
-    region,
-    bucket,
-    fields,
-    conditions,
-    expiresInSeconds
-  ) {
-    var now = this.getSkewCorrectedDate();
-    if (!credentials || !region || !bucket) {
-      throw new Error('Unable to create a POST object policy without a bucket,'
-        + ' region, and credentials');
-    }
-    fields = AWS.util.copy(fields || {});
-    conditions = (conditions || []).slice(0);
-    expiresInSeconds = expiresInSeconds || 3600;
-
-    var signingDate = AWS.util.date.iso8601(now).replace(/[:\-]|\.\d{3}/g, '');
-    var shortDate = signingDate.substr(0, 8);
-    var scope = v4Credentials.createScope(shortDate, region, 's3');
-    var credential = credentials.accessKeyId + '/' + scope;
-
-    fields['bucket'] = bucket;
-    fields['X-Amz-Algorithm'] = 'AWS4-HMAC-SHA256';
-    fields['X-Amz-Credential'] = credential;
-    fields['X-Amz-Date'] = signingDate;
-    if (credentials.sessionToken) {
-      fields['X-Amz-Security-Token'] = credentials.sessionToken;
-    }
-    for (var field in fields) {
-      if (fields.hasOwnProperty(field)) {
-        var condition = {};
-        condition[field] = fields[field];
-        conditions.push(condition);
-      }
-    }
-
-    fields.Policy = this.preparePostPolicy(
-      new Date(now.valueOf() + expiresInSeconds * 1000),
-      conditions
-    );
-    fields['X-Amz-Signature'] = AWS.util.crypto.hmac(
-      v4Credentials.getSigningKey(credentials, shortDate, region, 's3', true),
-      fields.Policy,
-      'hex'
-    );
-
-    return fields;
-  },
-
-  /**
-   * @api private
-   */
-  preparePostPolicy: function preparePostPolicy(expiration, conditions) {
-    return AWS.util.base64.encode(JSON.stringify({
-      expiration: AWS.util.date.iso8601(expiration),
-      conditions: conditions
-    }));
-  },
-
-  /**
-   * @api private
-   */
-  prepareSignedUrl: function prepareSignedUrl(request) {
-    request.addListener('validate', request.service.noPresignedContentLength);
-    request.removeListener('build', request.service.addContentType);
-    if (!request.params.Body) {
-      // no Content-MD5/SHA-256 if body is not provided
-      request.removeListener('build', request.service.computeContentMd5);
-    } else {
-      request.addListener('afterBuild', AWS.EventListeners.Core.COMPUTE_SHA256);
-    }
-  },
-
-  /**
-   * @api private
-   * @param request
-   */
-  disableBodySigning: function disableBodySigning(request) {
-    var headers = request.httpRequest.headers;
-    // Add the header to anything that isn't a presigned url, unless that presigned url had a body defined
-    if (!Object.prototype.hasOwnProperty.call(headers, 'presigned-expires')) {
-      headers['X-Amz-Content-Sha256'] = 'UNSIGNED-PAYLOAD';
-    }
-  },
-
-  /**
-   * @api private
-   */
-  noPresignedContentLength: function noPresignedContentLength(request) {
-    if (request.params.ContentLength !== undefined) {
-      throw AWS.util.error(new Error(), {code: 'UnexpectedParameter',
-        message: 'ContentLength is not supported in pre-signed URLs.'});
-    }
-  },
-
-  createBucket: function createBucket(params, callback) {
-    // When creating a bucket *outside* the classic region, the location
-    // constraint must be set for the bucket and it must match the endpoint.
-    // This chunk of code will set the location constraint param based
-    // on the region (when possible), but it will not override a passed-in
-    // location constraint.
-    if (typeof params === 'function' || !params) {
-      callback = callback || params;
-      params = {};
-    }
-    var hostname = this.endpoint.hostname;
-    // copy params so that appending keys does not unintentioinallly
-    // mutate params object argument passed in by user
-    var copiedParams = AWS.util.copy(params);
-
-    if (hostname !== this.api.globalEndpoint && !params.CreateBucketConfiguration) {
-      copiedParams.CreateBucketConfiguration = { LocationConstraint: this.config.region };
-    }
-    return this.makeRequest('createBucket', copiedParams, callback);
-  },
-
-  /**
-   * @see AWS.S3.ManagedUpload
-   * @overload upload(params = {}, [options], [callback])
-   *   Uploads an arbitrarily sized buffer, blob, or stream, using intelligent
-   *   concurrent handling of parts if the payload is large enough. You can
-   *   configure the concurrent queue size by setting `options`. Note that this
-   *   is the only operation for which the SDK can retry requests with stream
-   *   bodies.
-   *
-   *   @param (see AWS.S3.putObject)
-   *   @option (see AWS.S3.ManagedUpload.constructor)
-   *   @return [AWS.S3.ManagedUpload] the managed upload object that can call
-   *     `send()` or track progress.
-   *   @example Uploading a stream object
-   *     var params = {Bucket: 'bucket', Key: 'key', Body: stream};
-   *     s3.upload(params, function(err, data) {
-   *       console.log(err, data);
-   *     });
-   *   @example Uploading a stream with concurrency of 1 and partSize of 10mb
-   *     var params = {Bucket: 'bucket', Key: 'key', Body: stream};
-   *     var options = {partSize: 10 * 1024 * 1024, queueSize: 1};
-   *     s3.upload(params, options, function(err, data) {
-   *       console.log(err, data);
-   *     });
-   * @callback callback function(err, data)
-   *   @param err [Error] an error or null if no error occurred.
-   *   @param data [map] The response data from the successful upload:
-   *   @param data.Location [String] the URL of the uploaded object
-   *   @param data.ETag [String] the ETag of the uploaded object
-   *   @param data.Bucket [String]  the bucket to which the object was uploaded
-   *   @param data.Key [String] the key to which the object was uploaded
-   */
-  upload: function upload(params, options, callback) {
-    if (typeof options === 'function' && callback === undefined) {
-      callback = options;
-      options = null;
-    }
-
-    options = options || {};
-    options = AWS.util.merge(options || {}, {service: this, params: params});
-
-    var uploader = new AWS.S3.ManagedUpload(options);
-    if (typeof callback === 'function') uploader.send(callback);
-    return uploader;
-  }
-});
-
-/**
- * @api private
- */
-AWS.S3.addPromisesToClass = function addPromisesToClass(PromiseDependency) {
-  this.prototype.getSignedUrlPromise = AWS.util.promisifyMethod('getSignedUrl', PromiseDependency);
-};
-
-/**
- * @api private
- */
-AWS.S3.deletePromisesFromClass = function deletePromisesFromClass() {
-  delete this.prototype.getSignedUrlPromise;
-};
-
-AWS.util.addPromises(AWS.S3);
-
+module.exports = require("tls");
 
 /***/ }),
 /* 17 */,
@@ -1645,8 +249,10 @@ AWS.util.addPromises(AWS.S3);
 /***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
 
 var AWS = __webpack_require__(395);
-var STS = __webpack_require__(733);
+var STS = __webpack_require__(106);
 var iniLoader = AWS.util.iniLoader;
+
+var ASSUME_ROLE_DEFAULT_REGION = 'us-east-1';
 
 /**
  * Represents credentials loaded from shared credentials file
@@ -1715,9 +321,9 @@ AWS.SharedIniFileCredentials = AWS.util.inherit(AWS.Credentials, {
    *     failing to establish a connection with the server after
    *     `connectTimeout` milliseconds. This timeout has no effect once a socket
    *     connection has been established.
-   *   * **timeout** [Integer] &mdash; Sets the socket to timeout after timeout
-   *     milliseconds of inactivity on the socket. Defaults to two minutes
-   *     (120000).
+   *   * **timeout** [Integer] &mdash; The number of milliseconds a request can
+   *     take before automatically being terminated.
+   *     Defaults to two minutes (120000).
    */
   constructor: function SharedIniFileCredentials(options) {
     AWS.Credentials.call(this);
@@ -1837,6 +443,27 @@ AWS.SharedIniFileCredentials = AWS.util.inherit(AWS.Credentials, {
     var mfaSerial = roleProfile['mfa_serial'];
     var sourceProfileName = roleProfile['source_profile'];
 
+    // From experimentation, the following behavior mimics the AWS CLI:
+    //
+    // 1. Use region from the profile if present.
+    // 2. Otherwise fall back to N. Virginia (global endpoint).
+    //
+    // It is necessary to do the fallback explicitly, because if
+    // 'AWS_STS_REGIONAL_ENDPOINTS=regional', the underlying STS client will
+    // otherwise throw an error if region is left 'undefined'.
+    //
+    // Experimentation shows that the AWS CLI (tested at version 1.18.136)
+    // ignores the following potential sources of a region for the purposes of
+    // this AssumeRole call:
+    //
+    // - The [default] profile
+    // - The AWS_REGION environment variable
+    //
+    // Ignoring the [default] profile for the purposes of AssumeRole is arguably
+    // a bug in the CLI since it does use the [default] region for service
+    // calls... but right now we're matching behavior of the other tool.
+    var profileRegion = roleProfile['region'] || ASSUME_ROLE_DEFAULT_REGION;
+
     if (!sourceProfileName) {
       throw AWS.util.error(
         new Error('source_profile is not set using profile ' + this.profile),
@@ -1864,6 +491,7 @@ AWS.SharedIniFileCredentials = AWS.util.inherit(AWS.Credentials, {
     this.roleArn = roleArn;
     var sts = new STS({
       credentials: sourceCredentials,
+      region: profileRegion,
       httpOptions: this.httpOptions
     });
 
@@ -1907,7 +535,91 @@ AWS.SharedIniFileCredentials = AWS.util.inherit(AWS.Credentials, {
 /***/ }),
 /* 23 */,
 /* 24 */,
-/* 25 */,
+/* 25 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+Object.defineProperty(exports, "v1", {
+  enumerable: true,
+  get: function () {
+    return _v.default;
+  }
+});
+Object.defineProperty(exports, "v3", {
+  enumerable: true,
+  get: function () {
+    return _v2.default;
+  }
+});
+Object.defineProperty(exports, "v4", {
+  enumerable: true,
+  get: function () {
+    return _v3.default;
+  }
+});
+Object.defineProperty(exports, "v5", {
+  enumerable: true,
+  get: function () {
+    return _v4.default;
+  }
+});
+Object.defineProperty(exports, "NIL", {
+  enumerable: true,
+  get: function () {
+    return _nil.default;
+  }
+});
+Object.defineProperty(exports, "version", {
+  enumerable: true,
+  get: function () {
+    return _version.default;
+  }
+});
+Object.defineProperty(exports, "validate", {
+  enumerable: true,
+  get: function () {
+    return _validate.default;
+  }
+});
+Object.defineProperty(exports, "stringify", {
+  enumerable: true,
+  get: function () {
+    return _stringify.default;
+  }
+});
+Object.defineProperty(exports, "parse", {
+  enumerable: true,
+  get: function () {
+    return _parse.default;
+  }
+});
+
+var _v = _interopRequireDefault(__webpack_require__(810));
+
+var _v2 = _interopRequireDefault(__webpack_require__(572));
+
+var _v3 = _interopRequireDefault(__webpack_require__(293));
+
+var _v4 = _interopRequireDefault(__webpack_require__(638));
+
+var _nil = _interopRequireDefault(__webpack_require__(4));
+
+var _version = _interopRequireDefault(__webpack_require__(135));
+
+var _validate = _interopRequireDefault(__webpack_require__(634));
+
+var _stringify = _interopRequireDefault(__webpack_require__(960));
+
+var _parse = _interopRequireDefault(__webpack_require__(204));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+/***/ }),
 /* 26 */,
 /* 27 */,
 /* 28 */,
@@ -1989,7 +701,7 @@ function propagateCloseEventToSources(streams) {
 /***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
 
 var AWS = __webpack_require__(395);
-var STS = __webpack_require__(733);
+var STS = __webpack_require__(106);
 
 /**
  * Represents temporary credentials retrieved from {AWS.STS}. Without any
@@ -2135,7 +847,7 @@ AWS.TemporaryCredentials = AWS.util.inherit(AWS.Credentials, {
 /* 56 */
 /***/ (function(module) {
 
-module.exports = {"version":"2.0","metadata":{"apiVersion":"2014-06-30","endpointPrefix":"cognito-identity","jsonVersion":"1.1","protocol":"json","serviceFullName":"Amazon Cognito Identity","serviceId":"Cognito Identity","signatureVersion":"v4","targetPrefix":"AWSCognitoIdentityService","uid":"cognito-identity-2014-06-30"},"operations":{"CreateIdentityPool":{"input":{"type":"structure","required":["IdentityPoolName","AllowUnauthenticatedIdentities"],"members":{"IdentityPoolName":{},"AllowUnauthenticatedIdentities":{"type":"boolean"},"AllowClassicFlow":{"type":"boolean"},"SupportedLoginProviders":{"shape":"S5"},"DeveloperProviderName":{},"OpenIdConnectProviderARNs":{"shape":"S9"},"CognitoIdentityProviders":{"shape":"Sb"},"SamlProviderARNs":{"shape":"Sg"},"IdentityPoolTags":{"shape":"Sh"}}},"output":{"shape":"Sk"}},"DeleteIdentities":{"input":{"type":"structure","required":["IdentityIdsToDelete"],"members":{"IdentityIdsToDelete":{"type":"list","member":{}}}},"output":{"type":"structure","members":{"UnprocessedIdentityIds":{"type":"list","member":{"type":"structure","members":{"IdentityId":{},"ErrorCode":{}}}}}}},"DeleteIdentityPool":{"input":{"type":"structure","required":["IdentityPoolId"],"members":{"IdentityPoolId":{}}}},"DescribeIdentity":{"input":{"type":"structure","required":["IdentityId"],"members":{"IdentityId":{}}},"output":{"shape":"Sv"}},"DescribeIdentityPool":{"input":{"type":"structure","required":["IdentityPoolId"],"members":{"IdentityPoolId":{}}},"output":{"shape":"Sk"}},"GetCredentialsForIdentity":{"input":{"type":"structure","required":["IdentityId"],"members":{"IdentityId":{},"Logins":{"shape":"S10"},"CustomRoleArn":{}}},"output":{"type":"structure","members":{"IdentityId":{},"Credentials":{"type":"structure","members":{"AccessKeyId":{},"SecretKey":{},"SessionToken":{},"Expiration":{"type":"timestamp"}}}}}},"GetId":{"input":{"type":"structure","required":["IdentityPoolId"],"members":{"AccountId":{},"IdentityPoolId":{},"Logins":{"shape":"S10"}}},"output":{"type":"structure","members":{"IdentityId":{}}}},"GetIdentityPoolRoles":{"input":{"type":"structure","required":["IdentityPoolId"],"members":{"IdentityPoolId":{}}},"output":{"type":"structure","members":{"IdentityPoolId":{},"Roles":{"shape":"S1c"},"RoleMappings":{"shape":"S1e"}}}},"GetOpenIdToken":{"input":{"type":"structure","required":["IdentityId"],"members":{"IdentityId":{},"Logins":{"shape":"S10"}}},"output":{"type":"structure","members":{"IdentityId":{},"Token":{}}}},"GetOpenIdTokenForDeveloperIdentity":{"input":{"type":"structure","required":["IdentityPoolId","Logins"],"members":{"IdentityPoolId":{},"IdentityId":{},"Logins":{"shape":"S10"},"TokenDuration":{"type":"long"}}},"output":{"type":"structure","members":{"IdentityId":{},"Token":{}}}},"ListIdentities":{"input":{"type":"structure","required":["IdentityPoolId","MaxResults"],"members":{"IdentityPoolId":{},"MaxResults":{"type":"integer"},"NextToken":{},"HideDisabled":{"type":"boolean"}}},"output":{"type":"structure","members":{"IdentityPoolId":{},"Identities":{"type":"list","member":{"shape":"Sv"}},"NextToken":{}}}},"ListIdentityPools":{"input":{"type":"structure","required":["MaxResults"],"members":{"MaxResults":{"type":"integer"},"NextToken":{}}},"output":{"type":"structure","members":{"IdentityPools":{"type":"list","member":{"type":"structure","members":{"IdentityPoolId":{},"IdentityPoolName":{}}}},"NextToken":{}}}},"ListTagsForResource":{"input":{"type":"structure","required":["ResourceArn"],"members":{"ResourceArn":{}}},"output":{"type":"structure","members":{"Tags":{"shape":"Sh"}}}},"LookupDeveloperIdentity":{"input":{"type":"structure","required":["IdentityPoolId"],"members":{"IdentityPoolId":{},"IdentityId":{},"DeveloperUserIdentifier":{},"MaxResults":{"type":"integer"},"NextToken":{}}},"output":{"type":"structure","members":{"IdentityId":{},"DeveloperUserIdentifierList":{"type":"list","member":{}},"NextToken":{}}}},"MergeDeveloperIdentities":{"input":{"type":"structure","required":["SourceUserIdentifier","DestinationUserIdentifier","DeveloperProviderName","IdentityPoolId"],"members":{"SourceUserIdentifier":{},"DestinationUserIdentifier":{},"DeveloperProviderName":{},"IdentityPoolId":{}}},"output":{"type":"structure","members":{"IdentityId":{}}}},"SetIdentityPoolRoles":{"input":{"type":"structure","required":["IdentityPoolId","Roles"],"members":{"IdentityPoolId":{},"Roles":{"shape":"S1c"},"RoleMappings":{"shape":"S1e"}}}},"TagResource":{"input":{"type":"structure","required":["ResourceArn","Tags"],"members":{"ResourceArn":{},"Tags":{"shape":"Sh"}}},"output":{"type":"structure","members":{}}},"UnlinkDeveloperIdentity":{"input":{"type":"structure","required":["IdentityId","IdentityPoolId","DeveloperProviderName","DeveloperUserIdentifier"],"members":{"IdentityId":{},"IdentityPoolId":{},"DeveloperProviderName":{},"DeveloperUserIdentifier":{}}}},"UnlinkIdentity":{"input":{"type":"structure","required":["IdentityId","Logins","LoginsToRemove"],"members":{"IdentityId":{},"Logins":{"shape":"S10"},"LoginsToRemove":{"shape":"Sw"}}}},"UntagResource":{"input":{"type":"structure","required":["ResourceArn","TagKeys"],"members":{"ResourceArn":{},"TagKeys":{"type":"list","member":{}}}},"output":{"type":"structure","members":{}}},"UpdateIdentityPool":{"input":{"shape":"Sk"},"output":{"shape":"Sk"}}},"shapes":{"S5":{"type":"map","key":{},"value":{}},"S9":{"type":"list","member":{}},"Sb":{"type":"list","member":{"type":"structure","members":{"ProviderName":{},"ClientId":{},"ServerSideTokenCheck":{"type":"boolean"}}}},"Sg":{"type":"list","member":{}},"Sh":{"type":"map","key":{},"value":{}},"Sk":{"type":"structure","required":["IdentityPoolId","IdentityPoolName","AllowUnauthenticatedIdentities"],"members":{"IdentityPoolId":{},"IdentityPoolName":{},"AllowUnauthenticatedIdentities":{"type":"boolean"},"AllowClassicFlow":{"type":"boolean"},"SupportedLoginProviders":{"shape":"S5"},"DeveloperProviderName":{},"OpenIdConnectProviderARNs":{"shape":"S9"},"CognitoIdentityProviders":{"shape":"Sb"},"SamlProviderARNs":{"shape":"Sg"},"IdentityPoolTags":{"shape":"Sh"}}},"Sv":{"type":"structure","members":{"IdentityId":{},"Logins":{"shape":"Sw"},"CreationDate":{"type":"timestamp"},"LastModifiedDate":{"type":"timestamp"}}},"Sw":{"type":"list","member":{}},"S10":{"type":"map","key":{},"value":{}},"S1c":{"type":"map","key":{},"value":{}},"S1e":{"type":"map","key":{},"value":{"type":"structure","required":["Type"],"members":{"Type":{},"AmbiguousRoleResolution":{},"RulesConfiguration":{"type":"structure","required":["Rules"],"members":{"Rules":{"type":"list","member":{"type":"structure","required":["Claim","MatchType","Value","RoleARN"],"members":{"Claim":{},"MatchType":{},"Value":{},"RoleARN":{}}}}}}}}}}};
+module.exports = {"version":"2.0","metadata":{"apiVersion":"2014-06-30","endpointPrefix":"cognito-identity","jsonVersion":"1.1","protocol":"json","serviceFullName":"Amazon Cognito Identity","serviceId":"Cognito Identity","signatureVersion":"v4","targetPrefix":"AWSCognitoIdentityService","uid":"cognito-identity-2014-06-30"},"operations":{"CreateIdentityPool":{"input":{"type":"structure","required":["IdentityPoolName","AllowUnauthenticatedIdentities"],"members":{"IdentityPoolName":{},"AllowUnauthenticatedIdentities":{"type":"boolean"},"AllowClassicFlow":{"type":"boolean"},"SupportedLoginProviders":{"shape":"S5"},"DeveloperProviderName":{},"OpenIdConnectProviderARNs":{"shape":"S9"},"CognitoIdentityProviders":{"shape":"Sb"},"SamlProviderARNs":{"shape":"Sg"},"IdentityPoolTags":{"shape":"Sh"}}},"output":{"shape":"Sk"}},"DeleteIdentities":{"input":{"type":"structure","required":["IdentityIdsToDelete"],"members":{"IdentityIdsToDelete":{"type":"list","member":{}}}},"output":{"type":"structure","members":{"UnprocessedIdentityIds":{"type":"list","member":{"type":"structure","members":{"IdentityId":{},"ErrorCode":{}}}}}}},"DeleteIdentityPool":{"input":{"type":"structure","required":["IdentityPoolId"],"members":{"IdentityPoolId":{}}}},"DescribeIdentity":{"input":{"type":"structure","required":["IdentityId"],"members":{"IdentityId":{}}},"output":{"shape":"Sv"}},"DescribeIdentityPool":{"input":{"type":"structure","required":["IdentityPoolId"],"members":{"IdentityPoolId":{}}},"output":{"shape":"Sk"}},"GetCredentialsForIdentity":{"input":{"type":"structure","required":["IdentityId"],"members":{"IdentityId":{},"Logins":{"shape":"S10"},"CustomRoleArn":{}}},"output":{"type":"structure","members":{"IdentityId":{},"Credentials":{"type":"structure","members":{"AccessKeyId":{},"SecretKey":{},"SessionToken":{},"Expiration":{"type":"timestamp"}}}}},"authtype":"none"},"GetId":{"input":{"type":"structure","required":["IdentityPoolId"],"members":{"AccountId":{},"IdentityPoolId":{},"Logins":{"shape":"S10"}}},"output":{"type":"structure","members":{"IdentityId":{}}},"authtype":"none"},"GetIdentityPoolRoles":{"input":{"type":"structure","required":["IdentityPoolId"],"members":{"IdentityPoolId":{}}},"output":{"type":"structure","members":{"IdentityPoolId":{},"Roles":{"shape":"S1c"},"RoleMappings":{"shape":"S1e"}}}},"GetOpenIdToken":{"input":{"type":"structure","required":["IdentityId"],"members":{"IdentityId":{},"Logins":{"shape":"S10"}}},"output":{"type":"structure","members":{"IdentityId":{},"Token":{}}},"authtype":"none"},"GetOpenIdTokenForDeveloperIdentity":{"input":{"type":"structure","required":["IdentityPoolId","Logins"],"members":{"IdentityPoolId":{},"IdentityId":{},"Logins":{"shape":"S10"},"PrincipalTags":{"shape":"S1s"},"TokenDuration":{"type":"long"}}},"output":{"type":"structure","members":{"IdentityId":{},"Token":{}}}},"GetPrincipalTagAttributeMap":{"input":{"type":"structure","required":["IdentityPoolId","IdentityProviderName"],"members":{"IdentityPoolId":{},"IdentityProviderName":{}}},"output":{"type":"structure","members":{"IdentityPoolId":{},"IdentityProviderName":{},"UseDefaults":{"type":"boolean"},"PrincipalTags":{"shape":"S1s"}}}},"ListIdentities":{"input":{"type":"structure","required":["IdentityPoolId","MaxResults"],"members":{"IdentityPoolId":{},"MaxResults":{"type":"integer"},"NextToken":{},"HideDisabled":{"type":"boolean"}}},"output":{"type":"structure","members":{"IdentityPoolId":{},"Identities":{"type":"list","member":{"shape":"Sv"}},"NextToken":{}}}},"ListIdentityPools":{"input":{"type":"structure","required":["MaxResults"],"members":{"MaxResults":{"type":"integer"},"NextToken":{}}},"output":{"type":"structure","members":{"IdentityPools":{"type":"list","member":{"type":"structure","members":{"IdentityPoolId":{},"IdentityPoolName":{}}}},"NextToken":{}}}},"ListTagsForResource":{"input":{"type":"structure","required":["ResourceArn"],"members":{"ResourceArn":{}}},"output":{"type":"structure","members":{"Tags":{"shape":"Sh"}}}},"LookupDeveloperIdentity":{"input":{"type":"structure","required":["IdentityPoolId"],"members":{"IdentityPoolId":{},"IdentityId":{},"DeveloperUserIdentifier":{},"MaxResults":{"type":"integer"},"NextToken":{}}},"output":{"type":"structure","members":{"IdentityId":{},"DeveloperUserIdentifierList":{"type":"list","member":{}},"NextToken":{}}}},"MergeDeveloperIdentities":{"input":{"type":"structure","required":["SourceUserIdentifier","DestinationUserIdentifier","DeveloperProviderName","IdentityPoolId"],"members":{"SourceUserIdentifier":{},"DestinationUserIdentifier":{},"DeveloperProviderName":{},"IdentityPoolId":{}}},"output":{"type":"structure","members":{"IdentityId":{}}}},"SetIdentityPoolRoles":{"input":{"type":"structure","required":["IdentityPoolId","Roles"],"members":{"IdentityPoolId":{},"Roles":{"shape":"S1c"},"RoleMappings":{"shape":"S1e"}}}},"SetPrincipalTagAttributeMap":{"input":{"type":"structure","required":["IdentityPoolId","IdentityProviderName"],"members":{"IdentityPoolId":{},"IdentityProviderName":{},"UseDefaults":{"type":"boolean"},"PrincipalTags":{"shape":"S1s"}}},"output":{"type":"structure","members":{"IdentityPoolId":{},"IdentityProviderName":{},"UseDefaults":{"type":"boolean"},"PrincipalTags":{"shape":"S1s"}}}},"TagResource":{"input":{"type":"structure","required":["ResourceArn","Tags"],"members":{"ResourceArn":{},"Tags":{"shape":"Sh"}}},"output":{"type":"structure","members":{}}},"UnlinkDeveloperIdentity":{"input":{"type":"structure","required":["IdentityId","IdentityPoolId","DeveloperProviderName","DeveloperUserIdentifier"],"members":{"IdentityId":{},"IdentityPoolId":{},"DeveloperProviderName":{},"DeveloperUserIdentifier":{}}}},"UnlinkIdentity":{"input":{"type":"structure","required":["IdentityId","Logins","LoginsToRemove"],"members":{"IdentityId":{},"Logins":{"shape":"S10"},"LoginsToRemove":{"shape":"Sw"}}},"authtype":"none"},"UntagResource":{"input":{"type":"structure","required":["ResourceArn","TagKeys"],"members":{"ResourceArn":{},"TagKeys":{"type":"list","member":{}}}},"output":{"type":"structure","members":{}}},"UpdateIdentityPool":{"input":{"shape":"Sk"},"output":{"shape":"Sk"}}},"shapes":{"S5":{"type":"map","key":{},"value":{}},"S9":{"type":"list","member":{}},"Sb":{"type":"list","member":{"type":"structure","members":{"ProviderName":{},"ClientId":{},"ServerSideTokenCheck":{"type":"boolean"}}}},"Sg":{"type":"list","member":{}},"Sh":{"type":"map","key":{},"value":{}},"Sk":{"type":"structure","required":["IdentityPoolId","IdentityPoolName","AllowUnauthenticatedIdentities"],"members":{"IdentityPoolId":{},"IdentityPoolName":{},"AllowUnauthenticatedIdentities":{"type":"boolean"},"AllowClassicFlow":{"type":"boolean"},"SupportedLoginProviders":{"shape":"S5"},"DeveloperProviderName":{},"OpenIdConnectProviderARNs":{"shape":"S9"},"CognitoIdentityProviders":{"shape":"Sb"},"SamlProviderARNs":{"shape":"Sg"},"IdentityPoolTags":{"shape":"Sh"}}},"Sv":{"type":"structure","members":{"IdentityId":{},"Logins":{"shape":"Sw"},"CreationDate":{"type":"timestamp"},"LastModifiedDate":{"type":"timestamp"}}},"Sw":{"type":"list","member":{}},"S10":{"type":"map","key":{},"value":{}},"S1c":{"type":"map","key":{},"value":{}},"S1e":{"type":"map","key":{},"value":{"type":"structure","required":["Type"],"members":{"Type":{},"AmbiguousRoleResolution":{},"RulesConfiguration":{"type":"structure","required":["Rules"],"members":{"Rules":{"type":"list","member":{"type":"structure","required":["Claim","MatchType","Value","RoleARN"],"members":{"Claim":{},"MatchType":{},"Value":{},"RoleARN":{}}}}}}}}},"S1s":{"type":"map","key":{},"value":{}}}};
 
 /***/ }),
 /* 57 */,
@@ -2143,7 +855,51 @@ module.exports = {"version":"2.0","metadata":{"apiVersion":"2014-06-30","endpoin
 /* 59 */,
 /* 60 */,
 /* 61 */,
-/* 62 */,
+/* 62 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+Object.defineProperty(exports, "v1", {
+  enumerable: true,
+  get: function () {
+    return _v.default;
+  }
+});
+Object.defineProperty(exports, "v3", {
+  enumerable: true,
+  get: function () {
+    return _v2.default;
+  }
+});
+Object.defineProperty(exports, "v4", {
+  enumerable: true,
+  get: function () {
+    return _v3.default;
+  }
+});
+Object.defineProperty(exports, "v5", {
+  enumerable: true,
+  get: function () {
+    return _v4.default;
+  }
+});
+
+var _v = _interopRequireDefault(__webpack_require__(893));
+
+var _v2 = _interopRequireDefault(__webpack_require__(209));
+
+var _v3 = _interopRequireDefault(__webpack_require__(733));
+
+var _v4 = _interopRequireDefault(__webpack_require__(384));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+/***/ }),
 /* 63 */,
 /* 64 */,
 /* 65 */,
@@ -2709,125 +1465,56 @@ exports.default = ProviderSync;
 /* 79 */,
 /* 80 */,
 /* 81 */,
-/* 82 */,
+/* 82 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+// We use any as a valid input type
+/* eslint-disable @typescript-eslint/no-explicit-any */
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.toCommandProperties = exports.toCommandValue = void 0;
+/**
+ * Sanitizes an input into a string so it can be passed into issueCommand safely
+ * @param input input to sanitize into a string
+ */
+function toCommandValue(input) {
+    if (input === null || input === undefined) {
+        return '';
+    }
+    else if (typeof input === 'string' || input instanceof String) {
+        return input;
+    }
+    return JSON.stringify(input);
+}
+exports.toCommandValue = toCommandValue;
+/**
+ *
+ * @param annotationProperties
+ * @returns The command properties to send with the actual annotation command
+ * See IssueCommandProperties: https://github.com/actions/runner/blob/main/src/Runner.Worker/ActionCommandManager.cs#L646
+ */
+function toCommandProperties(annotationProperties) {
+    if (!Object.keys(annotationProperties).length) {
+        return {};
+    }
+    return {
+        title: annotationProperties.title,
+        file: annotationProperties.file,
+        line: annotationProperties.startLine,
+        endLine: annotationProperties.endLine,
+        col: annotationProperties.startColumn,
+        endColumn: annotationProperties.endColumn
+    };
+}
+exports.toCommandProperties = toCommandProperties;
+//# sourceMappingURL=utils.js.map
+
+/***/ }),
 /* 83 */,
 /* 84 */,
 /* 85 */,
-/* 86 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
-
-var rng = __webpack_require__(139);
-var bytesToUuid = __webpack_require__(722);
-
-// **`v1()` - Generate time-based UUID**
-//
-// Inspired by https://github.com/LiosK/UUID.js
-// and http://docs.python.org/library/uuid.html
-
-var _nodeId;
-var _clockseq;
-
-// Previous uuid creation time
-var _lastMSecs = 0;
-var _lastNSecs = 0;
-
-// See https://github.com/broofa/node-uuid for API details
-function v1(options, buf, offset) {
-  var i = buf && offset || 0;
-  var b = buf || [];
-
-  options = options || {};
-  var node = options.node || _nodeId;
-  var clockseq = options.clockseq !== undefined ? options.clockseq : _clockseq;
-
-  // node and clockseq need to be initialized to random values if they're not
-  // specified.  We do this lazily to minimize issues related to insufficient
-  // system entropy.  See #189
-  if (node == null || clockseq == null) {
-    var seedBytes = rng();
-    if (node == null) {
-      // Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
-      node = _nodeId = [
-        seedBytes[0] | 0x01,
-        seedBytes[1], seedBytes[2], seedBytes[3], seedBytes[4], seedBytes[5]
-      ];
-    }
-    if (clockseq == null) {
-      // Per 4.2.2, randomize (14 bit) clockseq
-      clockseq = _clockseq = (seedBytes[6] << 8 | seedBytes[7]) & 0x3fff;
-    }
-  }
-
-  // UUID timestamps are 100 nano-second units since the Gregorian epoch,
-  // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
-  // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
-  // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
-  var msecs = options.msecs !== undefined ? options.msecs : new Date().getTime();
-
-  // Per 4.2.1.2, use count of uuid's generated during the current clock
-  // cycle to simulate higher resolution clock
-  var nsecs = options.nsecs !== undefined ? options.nsecs : _lastNSecs + 1;
-
-  // Time since last uuid creation (in msecs)
-  var dt = (msecs - _lastMSecs) + (nsecs - _lastNSecs)/10000;
-
-  // Per 4.2.1.2, Bump clockseq on clock regression
-  if (dt < 0 && options.clockseq === undefined) {
-    clockseq = clockseq + 1 & 0x3fff;
-  }
-
-  // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
-  // time interval
-  if ((dt < 0 || msecs > _lastMSecs) && options.nsecs === undefined) {
-    nsecs = 0;
-  }
-
-  // Per 4.2.1.2 Throw error if too many uuids are requested
-  if (nsecs >= 10000) {
-    throw new Error('uuid.v1(): Can\'t create more than 10M uuids/sec');
-  }
-
-  _lastMSecs = msecs;
-  _lastNSecs = nsecs;
-  _clockseq = clockseq;
-
-  // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
-  msecs += 12219292800000;
-
-  // `time_low`
-  var tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
-  b[i++] = tl >>> 24 & 0xff;
-  b[i++] = tl >>> 16 & 0xff;
-  b[i++] = tl >>> 8 & 0xff;
-  b[i++] = tl & 0xff;
-
-  // `time_mid`
-  var tmh = (msecs / 0x100000000 * 10000) & 0xfffffff;
-  b[i++] = tmh >>> 8 & 0xff;
-  b[i++] = tmh & 0xff;
-
-  // `time_high_and_version`
-  b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
-  b[i++] = tmh >>> 16 & 0xff;
-
-  // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
-  b[i++] = clockseq >>> 8 | 0x80;
-
-  // `clock_seq_low`
-  b[i++] = clockseq & 0xff;
-
-  // `node`
-  for (var n = 0; n < 6; ++n) {
-    b[i + n] = node[n];
-  }
-
-  return buf ? buf : bytesToUuid(b);
-}
-
-module.exports = v1;
-
-
-/***/ }),
+/* 86 */,
 /* 87 */
 /***/ (function(module) {
 
@@ -2848,7 +1535,70 @@ module.exports = require("os");
 /* 99 */,
 /* 100 */,
 /* 101 */,
-/* 102 */,
+/* 102 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+// For internal use, subject to change.
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.prepareKeyValueMessage = exports.issueFileCommand = void 0;
+// We use any as a valid input type
+/* eslint-disable @typescript-eslint/no-explicit-any */
+const fs = __importStar(__webpack_require__(747));
+const os = __importStar(__webpack_require__(87));
+const uuid_1 = __webpack_require__(25);
+const utils_1 = __webpack_require__(82);
+function issueFileCommand(command, message) {
+    const filePath = process.env[`GITHUB_${command}`];
+    if (!filePath) {
+        throw new Error(`Unable to find environment variable for file command ${command}`);
+    }
+    if (!fs.existsSync(filePath)) {
+        throw new Error(`Missing file at path: ${filePath}`);
+    }
+    fs.appendFileSync(filePath, `${utils_1.toCommandValue(message)}${os.EOL}`, {
+        encoding: 'utf8'
+    });
+}
+exports.issueFileCommand = issueFileCommand;
+function prepareKeyValueMessage(key, value) {
+    const delimiter = `ghadelimiter_${uuid_1.v4()}`;
+    const convertedValue = utils_1.toCommandValue(value);
+    // These should realistically never happen, but just in case someone finds a
+    // way to exploit uuid generation let's not allow keys or values that contain
+    // the delimiter.
+    if (key.includes(delimiter)) {
+        throw new Error(`Unexpected input: name should not contain the delimiter "${delimiter}"`);
+    }
+    if (convertedValue.includes(delimiter)) {
+        throw new Error(`Unexpected input: value should not contain the delimiter "${delimiter}"`);
+    }
+    return `${key}<<${delimiter}${os.EOL}${convertedValue}${os.EOL}${delimiter}`;
+}
+exports.prepareKeyValueMessage = prepareKeyValueMessage;
+//# sourceMappingURL=file-command.js.map
+
+/***/ }),
 /* 103 */
 /***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
 
@@ -2872,11 +1622,27 @@ __webpack_require__(751);
  * AWS.config.credentials = new AWS.EC2MetadataCredentials({
  *   httpOptions: { timeout: 5000 }, // 5 second timeout
  *   maxRetries: 10, // retry 10 times
- *   retryDelayOptions: { base: 200 } // see AWS.Config for information
+ *   retryDelayOptions: { base: 200 }, // see AWS.Config for information
+ *   logger: console // see AWS.Config for information
  * });
  * ```
  *
+ * If your requests are timing out in connecting to the metadata service, such
+ * as when testing on a development machine, you can use the connectTimeout
+ * option, specified in milliseconds, which also defaults to 1 second.
+ *
+ * If the requests failed or returns expired credentials, it will
+ * extend the expiration of current credential, with a warning message. For more
+ * information, please go to:
+ * https://docs.aws.amazon.com/sdkref/latest/guide/feature-static-credentials.html
+ *
+ * @!attribute originalExpiration
+ *   @return [Date] The optional original expiration of the current credential.
+ *   In case of AWS outage, the EC2 metadata will extend expiration of the
+ *   existing credential.
+ *
  * @see AWS.Config.retryDelayOptions
+ * @see AWS.Config.logger
  *
  * @!macro nobrowser
  */
@@ -2889,10 +1655,12 @@ AWS.EC2MetadataCredentials = AWS.util.inherit(AWS.Credentials, {
       {maxRetries: this.defaultMaxRetries}, options);
     if (!options.httpOptions) options.httpOptions = {};
     options.httpOptions = AWS.util.merge(
-      {timeout: this.defaultTimeout}, options.httpOptions);
+      {timeout: this.defaultTimeout,
+        connectTimeout: this.defaultConnectTimeout},
+       options.httpOptions);
 
     this.metadataService = new AWS.MetadataService(options);
-    this.metadata = {};
+    this.logger = options.logger || AWS.config && AWS.config.logger;
   },
 
   /**
@@ -2900,10 +1668,22 @@ AWS.EC2MetadataCredentials = AWS.util.inherit(AWS.Credentials, {
    */
   defaultTimeout: 1000,
 
+   /**
+   * @api private
+   */
+  defaultConnectTimeout: 1000,
+
   /**
    * @api private
    */
   defaultMaxRetries: 3,
+
+  /**
+   * The original expiration of the current credential. In case of AWS
+   * outage, the EC2 metadata will extend expiration of the existing
+   * credential.
+   */
+  originalExpiration: undefined,
 
   /**
    * Loads the credentials from the instance metadata service
@@ -2927,25 +1707,63 @@ AWS.EC2MetadataCredentials = AWS.util.inherit(AWS.Credentials, {
   load: function load(callback) {
     var self = this;
     self.metadataService.loadCredentials(function(err, creds) {
-      if (!err) {
-        var currentTime = AWS.util.date.getDate();
-        var expireTime = new Date(creds.Expiration);
-        if (expireTime < currentTime) {
-          err = AWS.util.error(
-            new Error('EC2 Instance Metadata Serivce provided expired credentials'),
-            { code: 'EC2MetadataCredentialsProviderFailure' }
-          );
+      if (err) {
+        if (self.hasLoadedCredentials()) {
+          self.extendExpirationIfExpired();
+          callback();
         } else {
-          self.expired = false;
-          self.metadata = creds;
-          self.accessKeyId = creds.AccessKeyId;
-          self.secretAccessKey = creds.SecretAccessKey;
-          self.sessionToken = creds.Token;
-          self.expireTime = expireTime;
+          callback(err);
         }
+      } else {
+        self.setCredentials(creds);
+        self.extendExpirationIfExpired();
+        callback();
       }
-      callback(err);
     });
+  },
+
+  /**
+   * Whether this credential has been loaded.
+   * @api private
+   */
+  hasLoadedCredentials: function hasLoadedCredentials() {
+    return this.AccessKeyId && this.secretAccessKey;
+  },
+
+  /**
+   * if expired, extend the expiration by 15 minutes base plus a jitter of 5
+   * minutes range.
+   * @api private
+   */
+  extendExpirationIfExpired: function extendExpirationIfExpired() {
+    if (this.needsRefresh()) {
+      this.originalExpiration = this.originalExpiration || this.expireTime;
+      this.expired = false;
+      var nextTimeout = 15 * 60 + Math.floor(Math.random() * 5 * 60);
+      var currentTime = AWS.util.date.getDate().getTime();
+      this.expireTime = new Date(currentTime + nextTimeout * 1000);
+      // TODO: add doc link;
+      this.logger.warn('Attempting credential expiration extension due to a '
+          + 'credential service availability issue. A refresh of these '
+          + 'credentials will be attempted again at ' + this.expireTime
+          + '\nFor more information, please visit: https://docs.aws.amazon.com/sdkref/latest/guide/feature-static-credentials.html');
+    }
+  },
+
+  /**
+   * Update the credential with new credential responded from EC2 metadata
+   * service.
+   * @api private
+   */
+  setCredentials: function setCredentials(creds) {
+    var currentTime = AWS.util.date.getDate().getTime();
+    var expireTime = new Date(creds.Expiration);
+    this.expired = currentTime >= expireTime ? true : false;
+    this.metadata = creds;
+    this.accessKeyId = creds.AccessKeyId;
+    this.secretAccessKey = creds.SecretAccessKey;
+    this.sessionToken = creds.Token;
+    this.expireTime = expireTime;
   }
 });
 
@@ -2953,10 +1771,69 @@ AWS.EC2MetadataCredentials = AWS.util.inherit(AWS.Credentials, {
 /***/ }),
 /* 104 */,
 /* 105 */,
-/* 106 */,
+/* 106 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+__webpack_require__(234);
+var AWS = __webpack_require__(395);
+var Service = AWS.Service;
+var apiLoader = AWS.apiLoader;
+
+apiLoader.services['sts'] = {};
+AWS.STS = Service.defineService('sts', ['2011-06-15']);
+__webpack_require__(861);
+Object.defineProperty(apiLoader.services['sts'], '2011-06-15', {
+  get: function get() {
+    var model = __webpack_require__(715);
+    model.paginators = __webpack_require__(262).pagination;
+    return model;
+  },
+  enumerable: true,
+  configurable: true
+});
+
+module.exports = AWS.STS;
+
+
+/***/ }),
 /* 107 */,
-/* 108 */,
-/* 109 */,
+/* 108 */
+/***/ (function(module) {
+
+module.exports = {"rules":{"*/*":{"endpoint":"{service}.{region}.amazonaws.com"},"cn-*/*":{"endpoint":"{service}.{region}.amazonaws.com.cn"},"us-iso-*/*":"usIso","us-isob-*/*":"usIsob","*/budgets":"globalSSL","*/cloudfront":"globalSSL","*/sts":"globalSSL","*/importexport":{"endpoint":"{service}.amazonaws.com","signatureVersion":"v2","globalEndpoint":true},"*/route53":"globalSSL","cn-*/route53":{"endpoint":"{service}.amazonaws.com.cn","globalEndpoint":true,"signingRegion":"cn-northwest-1"},"us-gov-*/route53":"globalGovCloud","us-iso-*/route53":{"endpoint":"{service}.c2s.ic.gov","globalEndpoint":true,"signingRegion":"us-iso-east-1"},"us-isob-*/route53":{"endpoint":"{service}.sc2s.sgov.gov","globalEndpoint":true,"signingRegion":"us-isob-east-1"},"*/waf":"globalSSL","*/iam":"globalSSL","cn-*/iam":{"endpoint":"{service}.cn-north-1.amazonaws.com.cn","globalEndpoint":true,"signingRegion":"cn-north-1"},"us-gov-*/iam":"globalGovCloud","us-gov-*/sts":{"endpoint":"{service}.{region}.amazonaws.com"},"us-gov-west-1/s3":"s3signature","us-west-1/s3":"s3signature","us-west-2/s3":"s3signature","eu-west-1/s3":"s3signature","ap-southeast-1/s3":"s3signature","ap-southeast-2/s3":"s3signature","ap-northeast-1/s3":"s3signature","sa-east-1/s3":"s3signature","us-east-1/s3":{"endpoint":"{service}.amazonaws.com","signatureVersion":"s3"},"us-east-1/sdb":{"endpoint":"{service}.amazonaws.com","signatureVersion":"v2"},"*/sdb":{"endpoint":"{service}.{region}.amazonaws.com","signatureVersion":"v2"},"*/resource-explorer-2":"dualstackByDefault","*/codecatalyst":"globalDualstackByDefault"},"fipsRules":{"*/*":"fipsStandard","us-gov-*/*":"fipsStandard","us-iso-*/*":{"endpoint":"{service}-fips.{region}.c2s.ic.gov"},"us-iso-*/dms":"usIso","us-isob-*/*":{"endpoint":"{service}-fips.{region}.sc2s.sgov.gov"},"us-isob-*/dms":"usIsob","cn-*/*":{"endpoint":"{service}-fips.{region}.amazonaws.com.cn"},"*/api.ecr":"fips.api.ecr","*/api.sagemaker":"fips.api.sagemaker","*/batch":"fipsDotPrefix","*/eks":"fipsDotPrefix","*/models.lex":"fips.models.lex","*/runtime.lex":"fips.runtime.lex","*/runtime.sagemaker":{"endpoint":"runtime-fips.sagemaker.{region}.amazonaws.com"},"*/iam":"fipsWithoutRegion","*/route53":"fipsWithoutRegion","*/transcribe":"fipsDotPrefix","*/waf":"fipsWithoutRegion","us-gov-*/transcribe":"fipsDotPrefix","us-gov-*/api.ecr":"fips.api.ecr","us-gov-*/api.sagemaker":"fips.api.sagemaker","us-gov-*/models.lex":"fips.models.lex","us-gov-*/runtime.lex":"fips.runtime.lex","us-gov-*/acm-pca":"fipsWithServiceOnly","us-gov-*/batch":"fipsWithServiceOnly","us-gov-*/config":"fipsWithServiceOnly","us-gov-*/eks":"fipsWithServiceOnly","us-gov-*/elasticmapreduce":"fipsWithServiceOnly","us-gov-*/identitystore":"fipsWithServiceOnly","us-gov-*/dynamodb":"fipsWithServiceOnly","us-gov-*/elasticloadbalancing":"fipsWithServiceOnly","us-gov-*/guardduty":"fipsWithServiceOnly","us-gov-*/monitoring":"fipsWithServiceOnly","us-gov-*/resource-groups":"fipsWithServiceOnly","us-gov-*/runtime.sagemaker":"fipsWithServiceOnly","us-gov-*/servicecatalog-appregistry":"fipsWithServiceOnly","us-gov-*/servicequotas":"fipsWithServiceOnly","us-gov-*/ssm":"fipsWithServiceOnly","us-gov-*/sts":"fipsWithServiceOnly","us-gov-*/support":"fipsWithServiceOnly","us-gov-west-1/states":"fipsWithServiceOnly","us-iso-east-1/elasticfilesystem":{"endpoint":"elasticfilesystem-fips.{region}.c2s.ic.gov"},"us-gov-west-1/organizations":"fipsWithServiceOnly","us-gov-west-1/route53":{"endpoint":"route53.us-gov.amazonaws.com"},"*/resource-explorer-2":"fipsDualstackByDefault","*/codecatalyst":"fipsGlobalDualstackByDefault"},"dualstackRules":{"*/*":{"endpoint":"{service}.{region}.api.aws"},"cn-*/*":{"endpoint":"{service}.{region}.api.amazonwebservices.com.cn"},"*/s3":"dualstackLegacy","cn-*/s3":"dualstackLegacyCn","*/s3-control":"dualstackLegacy","cn-*/s3-control":"dualstackLegacyCn","ap-south-1/ec2":"dualstackLegacyEc2","eu-west-1/ec2":"dualstackLegacyEc2","sa-east-1/ec2":"dualstackLegacyEc2","us-east-1/ec2":"dualstackLegacyEc2","us-east-2/ec2":"dualstackLegacyEc2","us-west-2/ec2":"dualstackLegacyEc2"},"dualstackFipsRules":{"*/*":{"endpoint":"{service}-fips.{region}.api.aws"},"cn-*/*":{"endpoint":"{service}-fips.{region}.api.amazonwebservices.com.cn"},"*/s3":"dualstackFipsLegacy","cn-*/s3":"dualstackFipsLegacyCn","*/s3-control":"dualstackFipsLegacy","cn-*/s3-control":"dualstackFipsLegacyCn"},"patterns":{"globalSSL":{"endpoint":"https://{service}.amazonaws.com","globalEndpoint":true,"signingRegion":"us-east-1"},"globalGovCloud":{"endpoint":"{service}.us-gov.amazonaws.com","globalEndpoint":true,"signingRegion":"us-gov-west-1"},"s3signature":{"endpoint":"{service}.{region}.amazonaws.com","signatureVersion":"s3"},"usIso":{"endpoint":"{service}.{region}.c2s.ic.gov"},"usIsob":{"endpoint":"{service}.{region}.sc2s.sgov.gov"},"fipsStandard":{"endpoint":"{service}-fips.{region}.amazonaws.com"},"fipsDotPrefix":{"endpoint":"fips.{service}.{region}.amazonaws.com"},"fipsWithoutRegion":{"endpoint":"{service}-fips.amazonaws.com"},"fips.api.ecr":{"endpoint":"ecr-fips.{region}.amazonaws.com"},"fips.api.sagemaker":{"endpoint":"api-fips.sagemaker.{region}.amazonaws.com"},"fips.models.lex":{"endpoint":"models-fips.lex.{region}.amazonaws.com"},"fips.runtime.lex":{"endpoint":"runtime-fips.lex.{region}.amazonaws.com"},"fipsWithServiceOnly":{"endpoint":"{service}.{region}.amazonaws.com"},"dualstackLegacy":{"endpoint":"{service}.dualstack.{region}.amazonaws.com"},"dualstackLegacyCn":{"endpoint":"{service}.dualstack.{region}.amazonaws.com.cn"},"dualstackFipsLegacy":{"endpoint":"{service}-fips.dualstack.{region}.amazonaws.com"},"dualstackFipsLegacyCn":{"endpoint":"{service}-fips.dualstack.{region}.amazonaws.com.cn"},"dualstackLegacyEc2":{"endpoint":"api.ec2.{region}.aws"},"dualstackByDefault":{"endpoint":"{service}.{region}.api.aws"},"fipsDualstackByDefault":{"endpoint":"{service}-fips.{region}.api.aws"},"globalDualstackByDefault":{"endpoint":"{service}.global.api.aws"},"fipsGlobalDualstackByDefault":{"endpoint":"{service}-fips.global.api.aws"}}};
+
+/***/ }),
+/* 109 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", { value: true });
+const async = __webpack_require__(728);
+const sync = __webpack_require__(593);
+const settings_1 = __webpack_require__(518);
+exports.Settings = settings_1.default;
+function stat(path, optionsOrSettingsOrCallback, callback) {
+    if (typeof optionsOrSettingsOrCallback === 'function') {
+        return async.read(path, getSettings(), optionsOrSettingsOrCallback);
+    }
+    async.read(path, getSettings(optionsOrSettingsOrCallback), callback);
+}
+exports.stat = stat;
+function statSync(path, optionsOrSettings) {
+    const settings = getSettings(optionsOrSettings);
+    return sync.read(path, settings);
+}
+exports.statSync = statSync;
+function getSettings(settingsOrOptions = {}) {
+    if (settingsOrOptions instanceof settings_1.default) {
+        return settingsOrOptions;
+    }
+    return new settings_1.default(settingsOrOptions);
+}
+
+
+/***/ }),
 /* 110 */,
 /* 111 */,
 /* 112 */,
@@ -2995,18 +1872,428 @@ exports.default = ProviderAsync;
 
 
 /***/ }),
-/* 114 */,
+/* 114 */
+/***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
+
+var AWS = __webpack_require__(395);
+var path = __webpack_require__(622);
+var crypto = __webpack_require__(417);
+var iniLoader = AWS.util.iniLoader;
+
+/**
+ *  Represents credentials from sso.getRoleCredentials API for
+ * `sso_*` values defined in shared credentials file.
+ *
+ * ## Using SSO credentials
+ *
+ * The credentials file must specify the information below to use sso:
+ *
+ *     [profile sso-profile]
+ *     sso_account_id = 012345678901
+ *     sso_region = **-****-*
+ *     sso_role_name = SampleRole
+ *     sso_start_url = https://d-******.awsapps.com/start
+ *
+ * or using the session format:
+ *
+ *     [profile sso-token]
+ *     sso_session = prod
+ *     sso_account_id = 012345678901
+ *     sso_role_name = SampleRole
+ *
+ *     [sso-session prod]
+ *     sso_region = **-****-*
+ *     sso_start_url = https://d-******.awsapps.com/start
+ *
+ * This information will be automatically added to your shared credentials file by running
+ * `aws configure sso`.
+ *
+ * ## Using custom profiles
+ *
+ * The SDK supports loading credentials for separate profiles. This can be done
+ * in two ways:
+ *
+ * 1. Set the `AWS_PROFILE` environment variable in your process prior to
+ *    loading the SDK.
+ * 2. Directly load the AWS.SsoCredentials provider:
+ *
+ * ```javascript
+ * var creds = new AWS.SsoCredentials({profile: 'myprofile'});
+ * AWS.config.credentials = creds;
+ * ```
+ *
+ * @!macro nobrowser
+ */
+AWS.SsoCredentials = AWS.util.inherit(AWS.Credentials, {
+  /**
+   * Creates a new SsoCredentials object.
+   *
+   * @param options [map] a set of options
+   * @option options profile [String] (AWS_PROFILE env var or 'default')
+   *   the name of the profile to load.
+   * @option options filename [String] ('~/.aws/credentials' or defined by
+   *   AWS_SHARED_CREDENTIALS_FILE process env var)
+   *   the filename to use when loading credentials.
+   * @option options callback [Function] (err) Credentials are eagerly loaded
+   *   by the constructor. When the callback is called with no error, the
+   *   credentials have been loaded successfully.
+   */
+  constructor: function SsoCredentials(options) {
+    AWS.Credentials.call(this);
+
+    options = options || {};
+    this.errorCode = 'SsoCredentialsProviderFailure';
+    this.expired = true;
+
+    this.filename = options.filename;
+    this.profile = options.profile || process.env.AWS_PROFILE || AWS.util.defaultProfile;
+    this.service = options.ssoClient;
+    this.httpOptions = options.httpOptions || null;
+    this.get(options.callback || AWS.util.fn.noop);
+  },
+
+  /**
+   * @api private
+   */
+  load: function load(callback) {
+    var self = this;
+
+    try {
+      var profiles = AWS.util.getProfilesFromSharedConfig(iniLoader, this.filename);
+      var profile = profiles[this.profile] || {};
+
+      if (Object.keys(profile).length === 0) {
+        throw AWS.util.error(
+          new Error('Profile ' + this.profile + ' not found'),
+          { code: self.errorCode }
+        );
+      }
+
+      if (profile.sso_session) {
+        if (!profile.sso_account_id || !profile.sso_role_name) {
+          throw AWS.util.error(
+            new Error('Profile ' + this.profile + ' with session ' + profile.sso_session +
+              ' does not have valid SSO credentials. Required parameters "sso_account_id", "sso_session", ' +
+              '"sso_role_name". Reference: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html'),
+            { code: self.errorCode }
+          );
+        }
+      } else {
+        if (!profile.sso_start_url || !profile.sso_account_id || !profile.sso_region || !profile.sso_role_name) {
+          throw AWS.util.error(
+            new Error('Profile ' + this.profile + ' does not have valid SSO credentials. Required parameters "sso_account_id", "sso_region", ' +
+            '"sso_role_name", "sso_start_url". Reference: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-sso.html'),
+            { code: self.errorCode }
+          );
+        }
+      }
+
+      this.getToken(this.profile, profile, function (err, token) {
+        if (err) {
+          return callback(err);
+        }
+        var request = {
+          accessToken: token,
+          accountId: profile.sso_account_id,
+          roleName: profile.sso_role_name,
+        };
+
+        if (!self.service || self.service.config.region !== profile.sso_region) {
+          self.service = new AWS.SSO({
+            region: profile.sso_region,
+            httpOptions: self.httpOptions,
+          });
+        }
+
+        self.service.getRoleCredentials(request, function(err, data) {
+          if (err || !data || !data.roleCredentials) {
+            callback(AWS.util.error(
+              err || new Error('Please log in using "aws sso login"'),
+              { code: self.errorCode }
+            ), null);
+          } else if (!data.roleCredentials.accessKeyId || !data.roleCredentials.secretAccessKey || !data.roleCredentials.sessionToken || !data.roleCredentials.expiration) {
+            throw AWS.util.error(new Error(
+              'SSO returns an invalid temporary credential.'
+            ));
+          } else {
+            self.expired = false;
+            self.accessKeyId = data.roleCredentials.accessKeyId;
+            self.secretAccessKey = data.roleCredentials.secretAccessKey;
+            self.sessionToken = data.roleCredentials.sessionToken;
+            self.expireTime = new Date(data.roleCredentials.expiration);
+            callback(null);
+          }
+        });
+      });
+    } catch (err) {
+      callback(err);
+    }
+  },
+
+  /**
+   * @private
+   * Uses legacy file system retrieval or if sso-session is set,
+   * use the SSOTokenProvider.
+   *
+   * @param {string} profileName - name of the profile.
+   * @param {object} profile - profile data containing sso_session or sso_start_url etc.
+   * @param {function} callback - called with (err, (string) token).
+   *
+   * @returns {void}
+   */
+  getToken: function getToken(profileName, profile, callback) {
+    var self = this;
+
+    if (profile.sso_session) {
+      var _iniLoader = AWS.util.iniLoader;
+      var ssoSessions = _iniLoader.loadSsoSessionsFrom();
+      var ssoSession = ssoSessions[profile.sso_session];
+      Object.assign(profile, ssoSession);
+
+      var ssoTokenProvider = new AWS.SSOTokenProvider({
+        profile: profileName,
+      });
+      ssoTokenProvider.load(function (err) {
+        if (err) {
+          return callback(err);
+        }
+        return callback(null, ssoTokenProvider.token);
+      });
+      return;
+    }
+
+    try {
+      /**
+       * The time window (15 mins) that SDK will treat the SSO token expires in before the defined expiration date in token.
+       * This is needed because server side may have invalidated the token before the defined expiration date.
+       */
+      var EXPIRE_WINDOW_MS = 15 * 60 * 1000;
+      var hasher = crypto.createHash('sha1');
+      var fileName = hasher.update(profile.sso_start_url).digest('hex') + '.json';
+      var cachePath = path.join(
+        iniLoader.getHomeDir(),
+        '.aws',
+        'sso',
+        'cache',
+        fileName
+      );
+      var cacheFile = AWS.util.readFileSync(cachePath);
+      var cacheContent = null;
+      if (cacheFile) {
+        cacheContent = JSON.parse(cacheFile);
+      }
+      if (!cacheContent) {
+        throw AWS.util.error(
+          new Error('Cached credentials not found under ' + this.profile + ' profile. Please make sure you log in with aws sso login first'),
+          { code: self.errorCode }
+        );
+      }
+
+      if (!cacheContent.startUrl || !cacheContent.region || !cacheContent.accessToken || !cacheContent.expiresAt) {
+        throw AWS.util.error(
+          new Error('Cached credentials are missing required properties. Try running aws sso login.')
+        );
+      }
+
+      if (new Date(cacheContent.expiresAt).getTime() - Date.now() <= EXPIRE_WINDOW_MS) {
+        throw AWS.util.error(new Error(
+          'The SSO session associated with this profile has expired. To refresh this SSO session run aws sso login with the corresponding profile.'
+        ));
+      }
+
+      return callback(null, cacheContent.accessToken);
+    } catch (err) {
+      return callback(err, null);
+    }
+  },
+
+  /**
+   * Loads the credentials from the AWS SSO process
+   *
+   * @callback callback function(err)
+   *   Called after the AWS SSO process has been executed. When this
+   *   callback is called with no error, it means that the credentials
+   *   information has been loaded into the object (as the `accessKeyId`,
+   *   `secretAccessKey`, and `sessionToken` properties).
+   *   @param err [Error] if an error occurred, this value will be filled
+   * @see get
+   */
+  refresh: function refresh(callback) {
+    iniLoader.clearCachedFiles();
+    this.coalesceRefresh(callback || AWS.util.fn.callback);
+  },
+});
+
+
+/***/ }),
 /* 115 */
-/***/ (function(__unusedmodule, exports) {
+/***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
 
-"use strict";
+var AWS = __webpack_require__(395);
 
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.isEnoentCodeError = void 0;
-function isEnoentCodeError(error) {
-    return error.code === 'ENOENT';
-}
-exports.isEnoentCodeError = isEnoentCodeError;
+/**
+ * Creates a token provider chain that searches for token in a list of
+ * token providers specified by the {providers} property.
+ *
+ * By default, the chain will use the {defaultProviders} to resolve token.
+ *
+ * ## Setting Providers
+ *
+ * Each provider in the {providers} list should be a function that returns
+ * a {AWS.Token} object, or a hardcoded token object. The function
+ * form allows for delayed execution of the Token construction.
+ *
+ * ## Resolving Token from a Chain
+ *
+ * Call {resolve} to return the first valid token object that can be
+ * loaded by the provider chain.
+ *
+ * For example, to resolve a chain with a custom provider that checks a file
+ * on disk after the set of {defaultProviders}:
+ *
+ * ```javascript
+ * var diskProvider = new FileTokenProvider('./token.json');
+ * var chain = new AWS.TokenProviderChain();
+ * chain.providers.push(diskProvider);
+ * chain.resolve();
+ * ```
+ *
+ * The above code will return the `diskProvider` object if the
+ * file contains token and the `defaultProviders` do not contain
+ * any token.
+ *
+ * @!attribute providers
+ *   @return [Array<AWS.Token, Function>]
+ *     a list of token objects or functions that return token
+ *     objects. If the provider is a function, the function will be
+ *     executed lazily when the provider needs to be checked for valid
+ *     token. By default, this object will be set to the {defaultProviders}.
+ *   @see defaultProviders
+ */
+AWS.TokenProviderChain = AWS.util.inherit(AWS.Token, {
+
+  /**
+   * Creates a new TokenProviderChain with a default set of providers
+   * specified by {defaultProviders}.
+   */
+  constructor: function TokenProviderChain(providers) {
+    if (providers) {
+      this.providers = providers;
+    } else {
+      this.providers = AWS.TokenProviderChain.defaultProviders.slice(0);
+    }
+    this.resolveCallbacks = [];
+  },
+
+  /**
+   * @!method  resolvePromise()
+   *   Returns a 'thenable' promise.
+   *   Resolves the provider chain by searching for the first token in {providers}.
+   *
+   *   Two callbacks can be provided to the `then` method on the returned promise.
+   *   The first callback will be called if the promise is fulfilled, and the second
+   *   callback will be called if the promise is rejected.
+   *   @callback fulfilledCallback function(token)
+   *     Called if the promise is fulfilled and the provider resolves the chain
+   *     to a token object
+   *     @param token [AWS.Token] the token object resolved by the provider chain.
+   *   @callback rejectedCallback function(error)
+   *     Called if the promise is rejected.
+   *     @param err [Error] the error object returned if no token is found.
+   *   @return [Promise] A promise that represents the state of the `resolve` method call.
+   *   @example Calling the `resolvePromise` method.
+   *     var promise = chain.resolvePromise();
+   *     promise.then(function(token) { ... }, function(err) { ... });
+   */
+
+  /**
+   * Resolves the provider chain by searching for the first token in {providers}.
+   *
+   * @callback callback function(err, token)
+   *   Called when the provider resolves the chain to a token object
+   *   or null if no token can be found.
+   *
+   *   @param err [Error] the error object returned if no token is found.
+   *   @param token [AWS.Token] the token object resolved by the provider chain.
+   * @return [AWS.TokenProviderChain] the provider, for chaining.
+   */
+  resolve: function resolve(callback) {
+    var self = this;
+    if (self.providers.length === 0) {
+      callback(new Error('No providers'));
+      return self;
+    }
+
+    if (self.resolveCallbacks.push(callback) === 1) {
+      var index = 0;
+      var providers = self.providers.slice(0);
+
+      function resolveNext(err, token) {
+        if ((!err && token) || index === providers.length) {
+          AWS.util.arrayEach(self.resolveCallbacks, function (callback) {
+            callback(err, token);
+          });
+          self.resolveCallbacks.length = 0;
+          return;
+        }
+
+        var provider = providers[index++];
+        if (typeof provider === 'function') {
+          token = provider.call();
+        } else {
+          token = provider;
+        }
+
+        if (token.get) {
+          token.get(function (getErr) {
+            resolveNext(getErr, getErr ? null : token);
+          });
+        } else {
+          resolveNext(null, token);
+        }
+      }
+
+      resolveNext();
+    }
+
+    return self;
+  }
+});
+
+/**
+ * The default set of providers used by a vanilla TokenProviderChain.
+ *
+ * In the browser:
+ *
+ * ```javascript
+ * AWS.TokenProviderChain.defaultProviders = []
+ * ```
+ *
+ * In Node.js:
+ *
+ * ```javascript
+ * AWS.TokenProviderChain.defaultProviders = [
+ *   function () { return new AWS.SSOTokenProvider(); },
+ * ]
+ * ```
+ */
+AWS.TokenProviderChain.defaultProviders = [];
+
+/**
+ * @api private
+ */
+AWS.TokenProviderChain.addPromisesToClass = function addPromisesToClass(PromiseDependency) {
+  this.prototype.resolvePromise = AWS.util.promisifyMethod('resolve', PromiseDependency);
+};
+
+/**
+ * @api private
+ */
+AWS.TokenProviderChain.deletePromisesFromClass = function deletePromisesFromClass() {
+  delete this.prototype.resolvePromise;
+};
+
+AWS.util.addPromises(AWS.TokenProviderChain);
 
 
 /***/ }),
@@ -3049,12 +2336,15 @@ var EndpointCache = /** @class */ (function () {
         var now = Date.now();
         var records = this.cache.get(keyString);
         if (records) {
-            for (var i = 0; i < records.length; i++) {
+            for (var i = records.length-1; i >= 0; i--) {
                 var record = records[i];
                 if (record.Expire < now) {
-                    this.cache.remove(keyString);
-                    return undefined;
+                    records.splice(i, 1);
                 }
+            }
+            if (records.length === 0) {
+                this.cache.remove(keyString);
+                return undefined;
             }
         }
         return records;
@@ -3108,28 +2398,413 @@ module.exports = require("child_process");
 /* 132 */,
 /* 133 */,
 /* 134 */,
-/* 135 */,
-/* 136 */,
+/* 135 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _validate = _interopRequireDefault(__webpack_require__(634));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function version(uuid) {
+  if (!(0, _validate.default)(uuid)) {
+    throw TypeError('Invalid UUID');
+  }
+
+  return parseInt(uuid.substr(14, 1), 16);
+}
+
+var _default = version;
+exports.default = _default;
+
+/***/ }),
+/* 136 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = _default;
+exports.URL = exports.DNS = void 0;
+
+var _stringify = _interopRequireDefault(__webpack_require__(960));
+
+var _parse = _interopRequireDefault(__webpack_require__(204));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function stringToBytes(str) {
+  str = unescape(encodeURIComponent(str)); // UTF8 escape
+
+  const bytes = [];
+
+  for (let i = 0; i < str.length; ++i) {
+    bytes.push(str.charCodeAt(i));
+  }
+
+  return bytes;
+}
+
+const DNS = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
+exports.DNS = DNS;
+const URL = '6ba7b811-9dad-11d1-80b4-00c04fd430c8';
+exports.URL = URL;
+
+function _default(name, version, hashfunc) {
+  function generateUUID(value, namespace, buf, offset) {
+    if (typeof value === 'string') {
+      value = stringToBytes(value);
+    }
+
+    if (typeof namespace === 'string') {
+      namespace = (0, _parse.default)(namespace);
+    }
+
+    if (namespace.length !== 16) {
+      throw TypeError('Namespace must be array-like (16 iterable integer values, 0-255)');
+    } // Compute hash of namespace and value, Per 4.3
+    // Future: Use spread syntax when supported on all platforms, e.g. `bytes =
+    // hashfunc([...namespace, ... value])`
+
+
+    let bytes = new Uint8Array(16 + value.length);
+    bytes.set(namespace);
+    bytes.set(value, namespace.length);
+    bytes = hashfunc(bytes);
+    bytes[6] = bytes[6] & 0x0f | version;
+    bytes[8] = bytes[8] & 0x3f | 0x80;
+
+    if (buf) {
+      offset = offset || 0;
+
+      for (let i = 0; i < 16; ++i) {
+        buf[offset + i] = bytes[i];
+      }
+
+      return buf;
+    }
+
+    return (0, _stringify.default)(bytes);
+  } // Function#name is not settable on some platforms (#270)
+
+
+  try {
+    generateUUID.name = name; // eslint-disable-next-line no-empty
+  } catch (err) {} // For CommonJS default export support
+
+
+  generateUUID.DNS = DNS;
+  generateUUID.URL = URL;
+  return generateUUID;
+}
+
+/***/ }),
 /* 137 */,
 /* 138 */,
-/* 139 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
+/* 139 */,
+/* 140 */,
+/* 141 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
-// Unique ID creation requires a high quality random # generator.  In node.js
-// this is pretty straight-forward - we use the crypto API.
+"use strict";
 
-var crypto = __webpack_require__(417);
 
-module.exports = function nodeRNG() {
-  return crypto.randomBytes(16);
+var net = __webpack_require__(631);
+var tls = __webpack_require__(16);
+var http = __webpack_require__(605);
+var https = __webpack_require__(211);
+var events = __webpack_require__(614);
+var assert = __webpack_require__(357);
+var util = __webpack_require__(669);
+
+
+exports.httpOverHttp = httpOverHttp;
+exports.httpsOverHttp = httpsOverHttp;
+exports.httpOverHttps = httpOverHttps;
+exports.httpsOverHttps = httpsOverHttps;
+
+
+function httpOverHttp(options) {
+  var agent = new TunnelingAgent(options);
+  agent.request = http.request;
+  return agent;
+}
+
+function httpsOverHttp(options) {
+  var agent = new TunnelingAgent(options);
+  agent.request = http.request;
+  agent.createSocket = createSecureSocket;
+  agent.defaultPort = 443;
+  return agent;
+}
+
+function httpOverHttps(options) {
+  var agent = new TunnelingAgent(options);
+  agent.request = https.request;
+  return agent;
+}
+
+function httpsOverHttps(options) {
+  var agent = new TunnelingAgent(options);
+  agent.request = https.request;
+  agent.createSocket = createSecureSocket;
+  agent.defaultPort = 443;
+  return agent;
+}
+
+
+function TunnelingAgent(options) {
+  var self = this;
+  self.options = options || {};
+  self.proxyOptions = self.options.proxy || {};
+  self.maxSockets = self.options.maxSockets || http.Agent.defaultMaxSockets;
+  self.requests = [];
+  self.sockets = [];
+
+  self.on('free', function onFree(socket, host, port, localAddress) {
+    var options = toOptions(host, port, localAddress);
+    for (var i = 0, len = self.requests.length; i < len; ++i) {
+      var pending = self.requests[i];
+      if (pending.host === options.host && pending.port === options.port) {
+        // Detect the request to connect same origin server,
+        // reuse the connection.
+        self.requests.splice(i, 1);
+        pending.request.onSocket(socket);
+        return;
+      }
+    }
+    socket.destroy();
+    self.removeSocket(socket);
+  });
+}
+util.inherits(TunnelingAgent, events.EventEmitter);
+
+TunnelingAgent.prototype.addRequest = function addRequest(req, host, port, localAddress) {
+  var self = this;
+  var options = mergeOptions({request: req}, self.options, toOptions(host, port, localAddress));
+
+  if (self.sockets.length >= this.maxSockets) {
+    // We are over limit so we'll add it to the queue.
+    self.requests.push(options);
+    return;
+  }
+
+  // If we are under maxSockets create a new one.
+  self.createSocket(options, function(socket) {
+    socket.on('free', onFree);
+    socket.on('close', onCloseOrRemove);
+    socket.on('agentRemove', onCloseOrRemove);
+    req.onSocket(socket);
+
+    function onFree() {
+      self.emit('free', socket, options);
+    }
+
+    function onCloseOrRemove(err) {
+      self.removeSocket(socket);
+      socket.removeListener('free', onFree);
+      socket.removeListener('close', onCloseOrRemove);
+      socket.removeListener('agentRemove', onCloseOrRemove);
+    }
+  });
 };
+
+TunnelingAgent.prototype.createSocket = function createSocket(options, cb) {
+  var self = this;
+  var placeholder = {};
+  self.sockets.push(placeholder);
+
+  var connectOptions = mergeOptions({}, self.proxyOptions, {
+    method: 'CONNECT',
+    path: options.host + ':' + options.port,
+    agent: false,
+    headers: {
+      host: options.host + ':' + options.port
+    }
+  });
+  if (options.localAddress) {
+    connectOptions.localAddress = options.localAddress;
+  }
+  if (connectOptions.proxyAuth) {
+    connectOptions.headers = connectOptions.headers || {};
+    connectOptions.headers['Proxy-Authorization'] = 'Basic ' +
+        new Buffer(connectOptions.proxyAuth).toString('base64');
+  }
+
+  debug('making CONNECT request');
+  var connectReq = self.request(connectOptions);
+  connectReq.useChunkedEncodingByDefault = false; // for v0.6
+  connectReq.once('response', onResponse); // for v0.6
+  connectReq.once('upgrade', onUpgrade);   // for v0.6
+  connectReq.once('connect', onConnect);   // for v0.7 or later
+  connectReq.once('error', onError);
+  connectReq.end();
+
+  function onResponse(res) {
+    // Very hacky. This is necessary to avoid http-parser leaks.
+    res.upgrade = true;
+  }
+
+  function onUpgrade(res, socket, head) {
+    // Hacky.
+    process.nextTick(function() {
+      onConnect(res, socket, head);
+    });
+  }
+
+  function onConnect(res, socket, head) {
+    connectReq.removeAllListeners();
+    socket.removeAllListeners();
+
+    if (res.statusCode !== 200) {
+      debug('tunneling socket could not be established, statusCode=%d',
+        res.statusCode);
+      socket.destroy();
+      var error = new Error('tunneling socket could not be established, ' +
+        'statusCode=' + res.statusCode);
+      error.code = 'ECONNRESET';
+      options.request.emit('error', error);
+      self.removeSocket(placeholder);
+      return;
+    }
+    if (head.length > 0) {
+      debug('got illegal response body from proxy');
+      socket.destroy();
+      var error = new Error('got illegal response body from proxy');
+      error.code = 'ECONNRESET';
+      options.request.emit('error', error);
+      self.removeSocket(placeholder);
+      return;
+    }
+    debug('tunneling connection has established');
+    self.sockets[self.sockets.indexOf(placeholder)] = socket;
+    return cb(socket);
+  }
+
+  function onError(cause) {
+    connectReq.removeAllListeners();
+
+    debug('tunneling socket could not be established, cause=%s\n',
+          cause.message, cause.stack);
+    var error = new Error('tunneling socket could not be established, ' +
+                          'cause=' + cause.message);
+    error.code = 'ECONNRESET';
+    options.request.emit('error', error);
+    self.removeSocket(placeholder);
+  }
+};
+
+TunnelingAgent.prototype.removeSocket = function removeSocket(socket) {
+  var pos = this.sockets.indexOf(socket)
+  if (pos === -1) {
+    return;
+  }
+  this.sockets.splice(pos, 1);
+
+  var pending = this.requests.shift();
+  if (pending) {
+    // If we have pending requests and a socket gets closed a new one
+    // needs to be created to take over in the pool for the one that closed.
+    this.createSocket(pending, function(socket) {
+      pending.request.onSocket(socket);
+    });
+  }
+};
+
+function createSecureSocket(options, cb) {
+  var self = this;
+  TunnelingAgent.prototype.createSocket.call(self, options, function(socket) {
+    var hostHeader = options.request.getHeader('host');
+    var tlsOptions = mergeOptions({}, self.options, {
+      socket: socket,
+      servername: hostHeader ? hostHeader.replace(/:.*$/, '') : options.host
+    });
+
+    // 0 is dummy port for v0.6
+    var secureSocket = tls.connect(0, tlsOptions);
+    self.sockets[self.sockets.indexOf(socket)] = secureSocket;
+    cb(secureSocket);
+  });
+}
+
+
+function toOptions(host, port, localAddress) {
+  if (typeof host === 'string') { // since v0.10
+    return {
+      host: host,
+      port: port,
+      localAddress: localAddress
+    };
+  }
+  return host; // for v0.11 or later
+}
+
+function mergeOptions(target) {
+  for (var i = 1, len = arguments.length; i < len; ++i) {
+    var overrides = arguments[i];
+    if (typeof overrides === 'object') {
+      var keys = Object.keys(overrides);
+      for (var j = 0, keyLen = keys.length; j < keyLen; ++j) {
+        var k = keys[j];
+        if (overrides[k] !== undefined) {
+          target[k] = overrides[k];
+        }
+      }
+    }
+  }
+  return target;
+}
+
+
+var debug;
+if (process.env.NODE_DEBUG && /\btunnel\b/.test(process.env.NODE_DEBUG)) {
+  debug = function() {
+    var args = Array.prototype.slice.call(arguments);
+    if (typeof args[0] === 'string') {
+      args[0] = 'TUNNEL: ' + args[0];
+    } else {
+      args.unshift('TUNNEL:');
+    }
+    console.error.apply(console, args);
+  }
+} else {
+  debug = function() {};
+}
+exports.debug = debug; // for test
 
 
 /***/ }),
-/* 140 */,
-/* 141 */,
 /* 142 */,
-/* 143 */,
+/* 143 */
+/***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
+
+var AWS = __webpack_require__(395);
+
+/**
+ * @api private
+ */
+AWS.Signers.Bearer = AWS.util.inherit(AWS.Signers.RequestSigner, {
+  constructor: function Bearer(request) {
+    AWS.Signers.RequestSigner.call(this, request);
+  },
+
+  addAuthorization: function addAuthorization(token) {
+    this.request.headers['Authorization'] = 'Bearer ' + token.token;
+  }
+});
+
+
+/***/ }),
 /* 144 */,
 /* 145 */,
 /* 146 */,
@@ -3140,8 +2815,8 @@ module.exports = function nodeRNG() {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", { value: true });
-const fsStat = __webpack_require__(858);
-const constants_1 = __webpack_require__(171);
+const fsStat = __webpack_require__(109);
+const constants_1 = __webpack_require__(900);
 const utils = __webpack_require__(933);
 function read(directory, settings) {
     if (!settings.stats && constants_1.IS_SUPPORT_READDIR_WITH_FILE_TYPES) {
@@ -3209,13 +2884,1563 @@ function e(e){return e&&"object"==typeof e&&"default"in e?e.default:e}var t=__we
 
 
 /***/ }),
-/* 154 */,
+/* 154 */
+/***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
+
+var AWS = __webpack_require__(395);
+
+/**
+ * Represents AWS token object, which contains {token}, and optional
+ * {expireTime}.
+ * Creating a `Token` object allows you to pass around your
+ * token to configuration and service objects.
+ *
+ * Note that this class typically does not need to be constructed manually,
+ * as the {AWS.Config} and {AWS.Service} classes both accept simple
+ * options hashes with the two keys. The token from this object will be used
+ * automatically in operations which require them.
+ *
+ * ## Expiring and Refreshing Token
+ *
+ * Occasionally token can expire in the middle of a long-running
+ * application. In this case, the SDK will automatically attempt to
+ * refresh the token from the storage location if the Token
+ * class implements the {refresh} method.
+ *
+ * If you are implementing a token storage location, you
+ * will want to create a subclass of the `Token` class and
+ * override the {refresh} method. This method allows token to be
+ * retrieved from the backing store, be it a file system, database, or
+ * some network storage. The method should reset the token attributes
+ * on the object.
+ *
+ * @!attribute token
+ *   @return [String] represents the literal token string. This will typically
+ *     be a base64 encoded string.
+ * @!attribute expireTime
+ *   @return [Date] a time when token should be considered expired. Used
+ *     in conjunction with {expired}.
+ * @!attribute expired
+ *   @return [Boolean] whether the token is expired and require a refresh. Used
+ *     in conjunction with {expireTime}.
+ */
+AWS.Token = AWS.util.inherit({
+  /**
+   * Creates a Token object with a given set of information in options hash.
+   * @option options token [String] represents the literal token string.
+   * @option options expireTime [Date] field representing the time at which
+   *   the token expires.
+   * @example Create a token object
+   *   var token = new AWS.Token({ token: 'token' });
+   */
+  constructor: function Token(options) {
+    // hide token from being displayed with util.inspect
+    AWS.util.hideProperties(this, ['token']);
+
+    this.expired = false;
+    this.expireTime = null;
+    this.refreshCallbacks = [];
+    if (arguments.length === 1) {
+      var options = arguments[0];
+      this.token = options.token;
+      this.expireTime = options.expireTime;
+    }
+  },
+
+  /**
+   * @return [Integer] the number of seconds before {expireTime} during which
+   *   the token will be considered expired.
+   */
+  expiryWindow: 15,
+
+  /**
+   * @return [Boolean] whether the Token object should call {refresh}
+   * @note Subclasses should override this method to provide custom refresh
+   *   logic.
+   */
+  needsRefresh: function needsRefresh() {
+    var currentTime = AWS.util.date.getDate().getTime();
+    var adjustedTime = new Date(currentTime + this.expiryWindow * 1000);
+
+    if (this.expireTime && adjustedTime > this.expireTime)
+      return true;
+
+    return this.expired || !this.token;
+  },
+
+  /**
+   * Gets the existing token, refreshing them if they are not yet loaded
+   * or have expired. Users should call this method before using {refresh},
+   * as this will not attempt to reload token when they are already
+   * loaded into the object.
+   *
+   * @callback callback function(err)
+   *   When this callback is called with no error, it means either token
+   *   do not need to be refreshed or refreshed token information has
+   *   been loaded into the object (as the `token` property).
+   *   @param err [Error] if an error occurred, this value will be filled
+   */
+  get: function get(callback) {
+    var self = this;
+    if (this.needsRefresh()) {
+      this.refresh(function(err) {
+        if (!err) self.expired = false; // reset expired flag
+        if (callback) callback(err);
+      });
+    } else if (callback) {
+      callback();
+    }
+  },
+
+  /**
+   * @!method  getPromise()
+   *   Returns a 'thenable' promise.
+   *   Gets the existing token, refreshing it if it's not yet loaded
+   *   or have expired. Users should call this method before using {refresh},
+   *   as this will not attempt to reload token when it's already
+   *   loaded into the object.
+   *
+   *   Two callbacks can be provided to the `then` method on the returned promise.
+   *   The first callback will be called if the promise is fulfilled, and the second
+   *   callback will be called if the promise is rejected.
+   *   @callback fulfilledCallback function()
+   *     Called if the promise is fulfilled. When this callback is called, it means
+   *     either token does not need to be refreshed or refreshed token information
+   *     has been loaded into the object (as the `token` property).
+   *   @callback rejectedCallback function(err)
+   *     Called if the promise is rejected.
+   *     @param err [Error] if an error occurred, this value will be filled.
+   *   @return [Promise] A promise that represents the state of the `get` call.
+   *   @example Calling the `getPromise` method.
+   *     var promise = tokenProvider.getPromise();
+   *     promise.then(function() { ... }, function(err) { ... });
+   */
+
+  /**
+   * @!method  refreshPromise()
+   *   Returns a 'thenable' promise.
+   *   Refreshes the token. Users should call {get} before attempting
+   *   to forcibly refresh token.
+   *
+   *   Two callbacks can be provided to the `then` method on the returned promise.
+   *   The first callback will be called if the promise is fulfilled, and the second
+   *   callback will be called if the promise is rejected.
+   *   @callback fulfilledCallback function()
+   *     Called if the promise is fulfilled. When this callback is called, it
+   *     means refreshed token information has been loaded into the object
+   *     (as the `token` property).
+   *   @callback rejectedCallback function(err)
+   *     Called if the promise is rejected.
+   *     @param err [Error] if an error occurred, this value will be filled.
+   *   @return [Promise] A promise that represents the state of the `refresh` call.
+   *   @example Calling the `refreshPromise` method.
+   *     var promise = tokenProvider.refreshPromise();
+   *     promise.then(function() { ... }, function(err) { ... });
+   */
+
+  /**
+   * Refreshes the token. Users should call {get} before attempting
+   * to forcibly refresh token.
+   *
+   * @callback callback function(err)
+   *   When this callback is called with no error, it means refreshed
+   *   token information has been loaded into the object (as the
+   *   `token` property).
+   *   @param err [Error] if an error occurred, this value will be filled
+   * @note Subclasses should override this class to reset the
+   *   {token} on the token object and then call the callback with
+   *   any error information.
+   * @see get
+   */
+  refresh: function refresh(callback) {
+    this.expired = false;
+    callback();
+  },
+
+  /**
+   * @api private
+   * @param callback
+   */
+  coalesceRefresh: function coalesceRefresh(callback, sync) {
+    var self = this;
+    if (self.refreshCallbacks.push(callback) === 1) {
+      self.load(function onLoad(err) {
+        AWS.util.arrayEach(self.refreshCallbacks, function(callback) {
+          if (sync) {
+            callback(err);
+          } else {
+            // callback could throw, so defer to ensure all callbacks are notified
+            AWS.util.defer(function () {
+              callback(err);
+            });
+          }
+        });
+        self.refreshCallbacks.length = 0;
+      });
+    }
+  },
+
+  /**
+   * @api private
+   * @param callback
+   */
+  load: function load(callback) {
+    callback();
+  }
+});
+
+/**
+ * @api private
+ */
+AWS.Token.addPromisesToClass = function addPromisesToClass(PromiseDependency) {
+  this.prototype.getPromise = AWS.util.promisifyMethod('get', PromiseDependency);
+  this.prototype.refreshPromise = AWS.util.promisifyMethod('refresh', PromiseDependency);
+};
+
+/**
+ * @api private
+ */
+AWS.Token.deletePromisesFromClass = function deletePromisesFromClass() {
+  delete this.prototype.getPromise;
+  delete this.prototype.refreshPromise;
+};
+
+AWS.util.addPromises(AWS.Token);
+
+
+/***/ }),
 /* 155 */,
 /* 156 */,
 /* 157 */,
-/* 158 */,
+/* 158 */
+/***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
+
+var AWS = __webpack_require__(395);
+var v4Credentials = __webpack_require__(819);
+var resolveRegionalEndpointsFlag = __webpack_require__(232);
+var s3util = __webpack_require__(338);
+var regionUtil = __webpack_require__(546);
+
+// Pull in managed upload extension
+__webpack_require__(856);
+
+/**
+ * @api private
+ */
+var operationsWith200StatusCodeError = {
+  'completeMultipartUpload': true,
+  'copyObject': true,
+  'uploadPartCopy': true
+};
+
+/**
+ * @api private
+ */
+ var regionRedirectErrorCodes = [
+  'AuthorizationHeaderMalformed', // non-head operations on virtual-hosted global bucket endpoints
+  'BadRequest', // head operations on virtual-hosted global bucket endpoints
+  'PermanentRedirect', // non-head operations on path-style or regional endpoints
+  301 // head operations on path-style or regional endpoints
+ ];
+
+var OBJECT_LAMBDA_SERVICE = 's3-object-lambda';
+
+AWS.util.update(AWS.S3.prototype, {
+  /**
+   * @api private
+   */
+  getSignatureVersion: function getSignatureVersion(request) {
+    var defaultApiVersion = this.api.signatureVersion;
+    var userDefinedVersion = this._originalConfig ? this._originalConfig.signatureVersion : null;
+    var regionDefinedVersion = this.config.signatureVersion;
+    var isPresigned = request ? request.isPresigned() : false;
+    /*
+      1) User defined version specified:
+        a) always return user defined version
+      2) No user defined version specified:
+        a) If not using presigned urls, default to V4
+        b) If using presigned urls, default to lowest version the region supports
+    */
+    if (userDefinedVersion) {
+      userDefinedVersion = userDefinedVersion === 'v2' ? 's3' : userDefinedVersion;
+      return userDefinedVersion;
+    }
+    if (isPresigned !== true) {
+      defaultApiVersion = 'v4';
+    } else if (regionDefinedVersion) {
+      defaultApiVersion = regionDefinedVersion;
+    }
+    return defaultApiVersion;
+  },
+
+  /**
+   * @api private
+   */
+  getSigningName: function getSigningName(req) {
+    if (req && req.operation === 'writeGetObjectResponse') {
+      return OBJECT_LAMBDA_SERVICE;
+    }
+
+    var _super = AWS.Service.prototype.getSigningName;
+    return (req && req._parsedArn && req._parsedArn.service)
+      ? req._parsedArn.service
+      : _super.call(this);
+  },
+
+  /**
+   * @api private
+   */
+  getSignerClass: function getSignerClass(request) {
+    var signatureVersion = this.getSignatureVersion(request);
+    return AWS.Signers.RequestSigner.getVersion(signatureVersion);
+  },
+
+  /**
+   * @api private
+   */
+  validateService: function validateService() {
+    var msg;
+    var messages = [];
+
+    // default to us-east-1 when no region is provided
+    if (!this.config.region) this.config.region = 'us-east-1';
+
+    if (!this.config.endpoint && this.config.s3BucketEndpoint) {
+      messages.push('An endpoint must be provided when configuring ' +
+                    '`s3BucketEndpoint` to true.');
+    }
+    if (messages.length === 1) {
+      msg = messages[0];
+    } else if (messages.length > 1) {
+      msg = 'Multiple configuration errors:\n' + messages.join('\n');
+    }
+    if (msg) {
+      throw AWS.util.error(new Error(),
+        {name: 'InvalidEndpoint', message: msg});
+    }
+  },
+
+  /**
+   * @api private
+   */
+  shouldDisableBodySigning: function shouldDisableBodySigning(request) {
+    var signerClass = this.getSignerClass();
+    if (this.config.s3DisableBodySigning === true && signerClass === AWS.Signers.V4
+        && request.httpRequest.endpoint.protocol === 'https:') {
+      return true;
+    }
+    return false;
+  },
+
+  /**
+   * @api private
+   */
+  setupRequestListeners: function setupRequestListeners(request) {
+    var prependListener = true;
+    request.addListener('validate', this.validateScheme);
+    request.addListener('validate', this.validateBucketName, prependListener);
+    request.addListener('validate', this.optInUsEast1RegionalEndpoint, prependListener);
+
+    request.removeListener('validate',
+      AWS.EventListeners.Core.VALIDATE_REGION);
+    request.addListener('build', this.addContentType);
+    request.addListener('build', this.computeContentMd5);
+    request.addListener('build', this.computeSseCustomerKeyMd5);
+    request.addListener('build', this.populateURI);
+    request.addListener('afterBuild', this.addExpect100Continue);
+    request.addListener('extractError', this.extractError);
+    request.addListener('extractData', AWS.util.hoistPayloadMember);
+    request.addListener('extractData', this.extractData);
+    request.addListener('extractData', this.extractErrorFrom200Response);
+    request.addListener('beforePresign', this.prepareSignedUrl);
+    if (this.shouldDisableBodySigning(request))  {
+      request.removeListener('afterBuild', AWS.EventListeners.Core.COMPUTE_SHA256);
+      request.addListener('afterBuild', this.disableBodySigning);
+    }
+    //deal with ARNs supplied to Bucket
+    if (request.operation !== 'createBucket' && s3util.isArnInParam(request, 'Bucket')) {
+      // avoid duplicate parsing in the future
+      request._parsedArn = AWS.util.ARN.parse(request.params.Bucket);
+
+      request.removeListener('validate', this.validateBucketName);
+      request.removeListener('build', this.populateURI);
+      if (request._parsedArn.service === 's3') {
+        request.addListener('validate', s3util.validateS3AccessPointArn);
+        request.addListener('validate', this.validateArnResourceType);
+        request.addListener('validate', this.validateArnRegion);
+      } else if (request._parsedArn.service === 's3-outposts') {
+        request.addListener('validate', s3util.validateOutpostsAccessPointArn);
+        request.addListener('validate', s3util.validateOutpostsArn);
+        request.addListener('validate', s3util.validateArnRegion);
+      }
+      request.addListener('validate', s3util.validateArnAccount);
+      request.addListener('validate', s3util.validateArnService);
+      request.addListener('build', this.populateUriFromAccessPointArn);
+      request.addListener('build', s3util.validatePopulateUriFromArn);
+      return;
+    }
+    //listeners regarding region inference
+    request.addListener('validate', this.validateBucketEndpoint);
+    request.addListener('validate', this.correctBucketRegionFromCache);
+    request.onAsync('extractError', this.requestBucketRegion);
+    if (AWS.util.isBrowser()) {
+      request.onAsync('retry', this.reqRegionForNetworkingError);
+    }
+  },
+
+  /**
+   * @api private
+   */
+  validateScheme: function(req) {
+    var params = req.params,
+        scheme = req.httpRequest.endpoint.protocol,
+        sensitive = params.SSECustomerKey || params.CopySourceSSECustomerKey;
+    if (sensitive && scheme !== 'https:') {
+      var msg = 'Cannot send SSE keys over HTTP. Set \'sslEnabled\'' +
+        'to \'true\' in your configuration';
+      throw AWS.util.error(new Error(),
+        { code: 'ConfigError', message: msg });
+    }
+  },
+
+  /**
+   * @api private
+   */
+  validateBucketEndpoint: function(req) {
+    if (!req.params.Bucket && req.service.config.s3BucketEndpoint) {
+      var msg = 'Cannot send requests to root API with `s3BucketEndpoint` set.';
+      throw AWS.util.error(new Error(),
+        { code: 'ConfigError', message: msg });
+    }
+  },
+
+  /**
+   * @api private
+   */
+   validateArnRegion: function validateArnRegion(req) {
+    s3util.validateArnRegion(req, { allowFipsEndpoint: true });
+  },
+
+  /**
+   * Validate resource-type supplied in S3 ARN
+   */
+  validateArnResourceType: function validateArnResourceType(req) {
+    var resource = req._parsedArn.resource;
+
+    if (
+      resource.indexOf('accesspoint:') !== 0 &&
+      resource.indexOf('accesspoint/') !== 0
+    ) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidARN',
+        message: 'ARN resource should begin with \'accesspoint/\''
+      });
+    }
+  },
+
+  /**
+   * @api private
+   */
+  validateBucketName: function validateBucketName(req) {
+    var service = req.service;
+    var signatureVersion = service.getSignatureVersion(req);
+    var bucket = req.params && req.params.Bucket;
+    var key = req.params && req.params.Key;
+    var slashIndex = bucket && bucket.indexOf('/');
+    if (bucket && slashIndex >= 0) {
+      if (typeof key === 'string' && slashIndex > 0) {
+        req.params = AWS.util.copy(req.params);
+        // Need to include trailing slash to match sigv2 behavior
+        var prefix = bucket.substr(slashIndex + 1) || '';
+        req.params.Key = prefix + '/' + key;
+        req.params.Bucket = bucket.substr(0, slashIndex);
+      } else if (signatureVersion === 'v4') {
+        var msg = 'Bucket names cannot contain forward slashes. Bucket: ' + bucket;
+        throw AWS.util.error(new Error(),
+          { code: 'InvalidBucket', message: msg });
+      }
+    }
+  },
+
+  /**
+   * @api private
+   */
+  isValidAccelerateOperation: function isValidAccelerateOperation(operation) {
+    var invalidOperations = [
+      'createBucket',
+      'deleteBucket',
+      'listBuckets'
+    ];
+    return invalidOperations.indexOf(operation) === -1;
+  },
+
+  /**
+   * When us-east-1 region endpoint configuration is set, in stead of sending request to
+   * global endpoint(e.g. 's3.amazonaws.com'), we will send request to
+   * 's3.us-east-1.amazonaws.com'.
+   * @api private
+   */
+  optInUsEast1RegionalEndpoint: function optInUsEast1RegionalEndpoint(req) {
+    var service = req.service;
+    var config = service.config;
+    config.s3UsEast1RegionalEndpoint = resolveRegionalEndpointsFlag(service._originalConfig, {
+      env: 'AWS_S3_US_EAST_1_REGIONAL_ENDPOINT',
+      sharedConfig: 's3_us_east_1_regional_endpoint',
+      clientConfig: 's3UsEast1RegionalEndpoint'
+    });
+    if (
+      !(service._originalConfig || {}).endpoint &&
+      req.httpRequest.region === 'us-east-1' &&
+      config.s3UsEast1RegionalEndpoint === 'regional' &&
+      req.httpRequest.endpoint.hostname.indexOf('s3.amazonaws.com') >= 0
+    ) {
+      var insertPoint = config.endpoint.indexOf('.amazonaws.com');
+      regionalEndpoint = config.endpoint.substring(0, insertPoint) +
+        '.us-east-1' + config.endpoint.substring(insertPoint);
+      req.httpRequest.updateEndpoint(regionalEndpoint);
+    }
+  },
+
+  /**
+   * S3 prefers dns-compatible bucket names to be moved from the uri path
+   * to the hostname as a sub-domain.  This is not possible, even for dns-compat
+   * buckets when using SSL and the bucket name contains a dot ('.').  The
+   * ssl wildcard certificate is only 1-level deep.
+   *
+   * @api private
+   */
+  populateURI: function populateURI(req) {
+    var httpRequest = req.httpRequest;
+    var b = req.params.Bucket;
+    var service = req.service;
+    var endpoint = httpRequest.endpoint;
+    if (b) {
+      if (!service.pathStyleBucketName(b)) {
+        if (service.config.useAccelerateEndpoint && service.isValidAccelerateOperation(req.operation)) {
+          if (service.config.useDualstackEndpoint) {
+            endpoint.hostname = b + '.s3-accelerate.dualstack.amazonaws.com';
+          } else {
+            endpoint.hostname = b + '.s3-accelerate.amazonaws.com';
+          }
+        } else if (!service.config.s3BucketEndpoint) {
+          endpoint.hostname =
+            b + '.' + endpoint.hostname;
+        }
+
+        var port = endpoint.port;
+        if (port !== 80 && port !== 443) {
+          endpoint.host = endpoint.hostname + ':' +
+            endpoint.port;
+        } else {
+          endpoint.host = endpoint.hostname;
+        }
+
+        httpRequest.virtualHostedBucket = b; // needed for signing the request
+        service.removeVirtualHostedBucketFromPath(req);
+      }
+    }
+  },
+
+  /**
+   * Takes the bucket name out of the path if bucket is virtual-hosted
+   *
+   * @api private
+   */
+  removeVirtualHostedBucketFromPath: function removeVirtualHostedBucketFromPath(req) {
+    var httpRequest = req.httpRequest;
+    var bucket = httpRequest.virtualHostedBucket;
+    if (bucket && httpRequest.path) {
+      if (req.params && req.params.Key) {
+        var encodedS3Key = '/' + AWS.util.uriEscapePath(req.params.Key);
+        if (httpRequest.path.indexOf(encodedS3Key) === 0 && (httpRequest.path.length === encodedS3Key.length || httpRequest.path[encodedS3Key.length] === '?')) {
+          //path only contains key or path contains only key and querystring
+          return;
+        }
+      }
+      httpRequest.path = httpRequest.path.replace(new RegExp('/' + bucket), '');
+      if (httpRequest.path[0] !== '/') {
+        httpRequest.path = '/' + httpRequest.path;
+      }
+    }
+  },
+
+  /**
+   * When user supply an access point ARN in the Bucket parameter, we need to
+   * populate the URI according to the ARN.
+   */
+  populateUriFromAccessPointArn: function populateUriFromAccessPointArn(req) {
+    var accessPointArn = req._parsedArn;
+
+    var isOutpostArn = accessPointArn.service === 's3-outposts';
+    var isObjectLambdaArn = accessPointArn.service === 's3-object-lambda';
+
+    var outpostsSuffix = isOutpostArn ? '.' + accessPointArn.outpostId: '';
+    var serviceName = isOutpostArn ? 's3-outposts': 's3-accesspoint';
+    var fipsSuffix = !isOutpostArn && req.service.config.useFipsEndpoint ? '-fips': '';
+    var dualStackSuffix = !isOutpostArn &&
+      req.service.config.useDualstackEndpoint ? '.dualstack' : '';
+
+    var endpoint = req.httpRequest.endpoint;
+    var dnsSuffix = regionUtil.getEndpointSuffix(accessPointArn.region);
+    var useArnRegion = req.service.config.s3UseArnRegion;
+
+    endpoint.hostname = [
+      accessPointArn.accessPoint + '-' + accessPointArn.accountId + outpostsSuffix,
+      serviceName + fipsSuffix + dualStackSuffix,
+      useArnRegion ? accessPointArn.region : req.service.config.region,
+      dnsSuffix
+    ].join('.');
+
+    if (isObjectLambdaArn) {
+      // should be in the format: "accesspoint/${accesspointName}"
+      var serviceName = 's3-object-lambda';
+      var accesspointName = accessPointArn.resource.split('/')[1];
+      var fipsSuffix = req.service.config.useFipsEndpoint ? '-fips': '';
+      endpoint.hostname = [
+        accesspointName + '-' + accessPointArn.accountId,
+        serviceName + fipsSuffix,
+        useArnRegion ? accessPointArn.region : req.service.config.region,
+        dnsSuffix
+      ].join('.');
+    }
+    endpoint.host = endpoint.hostname;
+    var encodedArn = AWS.util.uriEscape(req.params.Bucket);
+    var path = req.httpRequest.path;
+    //remove the Bucket value from path
+    req.httpRequest.path = path.replace(new RegExp('/' + encodedArn), '');
+    if (req.httpRequest.path[0] !== '/') {
+      req.httpRequest.path = '/' + req.httpRequest.path;
+    }
+    req.httpRequest.region = accessPointArn.region; //region used to sign
+  },
+
+  /**
+   * Adds Expect: 100-continue header if payload is greater-or-equal 1MB
+   * @api private
+   */
+  addExpect100Continue: function addExpect100Continue(req) {
+    var len = req.httpRequest.headers['Content-Length'];
+    if (AWS.util.isNode() && (len >= 1024 * 1024 || req.params.Body instanceof AWS.util.stream.Stream)) {
+      req.httpRequest.headers['Expect'] = '100-continue';
+    }
+  },
+
+  /**
+   * Adds a default content type if none is supplied.
+   *
+   * @api private
+   */
+  addContentType: function addContentType(req) {
+    var httpRequest = req.httpRequest;
+    if (httpRequest.method === 'GET' || httpRequest.method === 'HEAD') {
+      // Content-Type is not set in GET/HEAD requests
+      delete httpRequest.headers['Content-Type'];
+      return;
+    }
+
+    if (!httpRequest.headers['Content-Type']) { // always have a Content-Type
+      httpRequest.headers['Content-Type'] = 'application/octet-stream';
+    }
+
+    var contentType = httpRequest.headers['Content-Type'];
+    if (AWS.util.isBrowser()) {
+      if (typeof httpRequest.body === 'string' && !contentType.match(/;\s*charset=/)) {
+        var charset = '; charset=UTF-8';
+        httpRequest.headers['Content-Type'] += charset;
+      } else {
+        var replaceFn = function(_, prefix, charsetName) {
+          return prefix + charsetName.toUpperCase();
+        };
+
+        httpRequest.headers['Content-Type'] =
+          contentType.replace(/(;\s*charset=)(.+)$/, replaceFn);
+      }
+    }
+  },
+
+  /**
+   * Checks whether checksums should be computed for the request if it's not
+   * already set by {AWS.EventListeners.Core.COMPUTE_CHECKSUM}. It depends on
+   * whether {AWS.Config.computeChecksums} is set.
+   *
+   * @param req [AWS.Request] the request to check against
+   * @return [Boolean] whether to compute checksums for a request.
+   * @api private
+   */
+  willComputeChecksums: function willComputeChecksums(req) {
+    var rules = req.service.api.operations[req.operation].input.members;
+    var body = req.httpRequest.body;
+    var needsContentMD5 = req.service.config.computeChecksums &&
+      rules.ContentMD5 &&
+      !req.params.ContentMD5 &&
+      body &&
+      (AWS.util.Buffer.isBuffer(req.httpRequest.body) || typeof req.httpRequest.body === 'string');
+
+    // Sha256 signing disabled, and not a presigned url
+    if (needsContentMD5 && req.service.shouldDisableBodySigning(req) && !req.isPresigned()) {
+      return true;
+    }
+
+    // SigV2 and presign, for backwards compatibility purpose.
+    if (needsContentMD5 && this.getSignatureVersion(req) === 's3' && req.isPresigned()) {
+      return true;
+    }
+
+    return false;
+  },
+
+  /**
+   * A listener that computes the Content-MD5 and sets it in the header.
+   * This listener is to support S3-specific features like
+   * s3DisableBodySigning and SigV2 presign. Content MD5 logic for SigV4 is
+   * handled in AWS.EventListeners.Core.COMPUTE_CHECKSUM
+   *
+   * @api private
+   */
+  computeContentMd5: function computeContentMd5(req) {
+    if (req.service.willComputeChecksums(req)) {
+      var md5 = AWS.util.crypto.md5(req.httpRequest.body, 'base64');
+      req.httpRequest.headers['Content-MD5'] = md5;
+    }
+  },
+
+  /**
+   * @api private
+   */
+  computeSseCustomerKeyMd5: function computeSseCustomerKeyMd5(req) {
+    var keys = {
+      SSECustomerKey: 'x-amz-server-side-encryption-customer-key-MD5',
+      CopySourceSSECustomerKey: 'x-amz-copy-source-server-side-encryption-customer-key-MD5'
+    };
+    AWS.util.each(keys, function(key, header) {
+      if (req.params[key]) {
+        var value = AWS.util.crypto.md5(req.params[key], 'base64');
+        req.httpRequest.headers[header] = value;
+      }
+    });
+  },
+
+  /**
+   * Returns true if the bucket name should be left in the URI path for
+   * a request to S3.  This function takes into account the current
+   * endpoint protocol (e.g. http or https).
+   *
+   * @api private
+   */
+  pathStyleBucketName: function pathStyleBucketName(bucketName) {
+    // user can force path style requests via the configuration
+    if (this.config.s3ForcePathStyle) return true;
+    if (this.config.s3BucketEndpoint) return false;
+
+    if (s3util.dnsCompatibleBucketName(bucketName)) {
+      return (this.config.sslEnabled && bucketName.match(/\./)) ? true : false;
+    } else {
+      return true; // not dns compatible names must always use path style
+    }
+  },
+
+  /**
+   * For COPY operations, some can be error even with status code 200.
+   * SDK treats the response as exception when response body indicates
+   * an exception or body is empty.
+   *
+   * @api private
+   */
+  extractErrorFrom200Response: function extractErrorFrom200Response(resp) {
+    if (!operationsWith200StatusCodeError[resp.request.operation]) return;
+    var httpResponse = resp.httpResponse;
+    if (httpResponse.body && httpResponse.body.toString().match('<Error>')) {
+      // Response body with '<Error>...</Error>' indicates an exception.
+      // Get S3 client object. In ManagedUpload, this.service refers to
+      // S3 client object.
+      resp.data = null;
+      var service = this.service ? this.service : this;
+      service.extractError(resp);
+      throw resp.error;
+    } else if (!httpResponse.body || !httpResponse.body.toString().match(/<[\w_]/)) {
+      // When body is empty or incomplete, S3 might stop the request on detecting client
+      // side aborting the request.
+      resp.data = null;
+      throw AWS.util.error(new Error(), {
+        code: 'InternalError',
+        message: 'S3 aborted request'
+      });
+    }
+  },
+
+  /**
+   * @return [Boolean] whether the error can be retried
+   * @api private
+   */
+  retryableError: function retryableError(error, request) {
+    if (operationsWith200StatusCodeError[request.operation] &&
+        error.statusCode === 200) {
+      return true;
+    } else if (request._requestRegionForBucket &&
+        request.service.bucketRegionCache[request._requestRegionForBucket]) {
+      return false;
+    } else if (error && error.code === 'RequestTimeout') {
+      return true;
+    } else if (error &&
+        regionRedirectErrorCodes.indexOf(error.code) != -1 &&
+        error.region && error.region != request.httpRequest.region) {
+      request.httpRequest.region = error.region;
+      if (error.statusCode === 301) {
+        request.service.updateReqBucketRegion(request);
+      }
+      return true;
+    } else {
+      var _super = AWS.Service.prototype.retryableError;
+      return _super.call(this, error, request);
+    }
+  },
+
+  /**
+   * Updates httpRequest with region. If region is not provided, then
+   * the httpRequest will be updated based on httpRequest.region
+   *
+   * @api private
+   */
+  updateReqBucketRegion: function updateReqBucketRegion(request, region) {
+    var httpRequest = request.httpRequest;
+    if (typeof region === 'string' && region.length) {
+      httpRequest.region = region;
+    }
+    if (!httpRequest.endpoint.host.match(/s3(?!-accelerate).*\.amazonaws\.com$/)) {
+      return;
+    }
+    var service = request.service;
+    var s3Config = service.config;
+    var s3BucketEndpoint = s3Config.s3BucketEndpoint;
+    if (s3BucketEndpoint) {
+      delete s3Config.s3BucketEndpoint;
+    }
+    var newConfig = AWS.util.copy(s3Config);
+    delete newConfig.endpoint;
+    newConfig.region = httpRequest.region;
+
+    httpRequest.endpoint = (new AWS.S3(newConfig)).endpoint;
+    service.populateURI(request);
+    s3Config.s3BucketEndpoint = s3BucketEndpoint;
+    httpRequest.headers.Host = httpRequest.endpoint.host;
+
+    if (request._asm.currentState === 'validate') {
+      request.removeListener('build', service.populateURI);
+      request.addListener('build', service.removeVirtualHostedBucketFromPath);
+    }
+  },
+
+  /**
+   * Provides a specialized parser for getBucketLocation -- all other
+   * operations are parsed by the super class.
+   *
+   * @api private
+   */
+  extractData: function extractData(resp) {
+    var req = resp.request;
+    if (req.operation === 'getBucketLocation') {
+      var match = resp.httpResponse.body.toString().match(/>(.+)<\/Location/);
+      delete resp.data['_'];
+      if (match) {
+        resp.data.LocationConstraint = match[1];
+      } else {
+        resp.data.LocationConstraint = '';
+      }
+    }
+    var bucket = req.params.Bucket || null;
+    if (req.operation === 'deleteBucket' && typeof bucket === 'string' && !resp.error) {
+      req.service.clearBucketRegionCache(bucket);
+    } else {
+      var headers = resp.httpResponse.headers || {};
+      var region = headers['x-amz-bucket-region'] || null;
+      if (!region && req.operation === 'createBucket' && !resp.error) {
+        var createBucketConfiguration = req.params.CreateBucketConfiguration;
+        if (!createBucketConfiguration) {
+          region = 'us-east-1';
+        } else if (createBucketConfiguration.LocationConstraint === 'EU') {
+          region = 'eu-west-1';
+        } else {
+          region = createBucketConfiguration.LocationConstraint;
+        }
+      }
+      if (region) {
+          if (bucket && region !== req.service.bucketRegionCache[bucket]) {
+            req.service.bucketRegionCache[bucket] = region;
+          }
+      }
+    }
+    req.service.extractRequestIds(resp);
+  },
+
+  /**
+   * Extracts an error object from the http response.
+   *
+   * @api private
+   */
+  extractError: function extractError(resp) {
+    var codes = {
+      304: 'NotModified',
+      403: 'Forbidden',
+      400: 'BadRequest',
+      404: 'NotFound'
+    };
+
+    var req = resp.request;
+    var code = resp.httpResponse.statusCode;
+    var body = resp.httpResponse.body || '';
+
+    var headers = resp.httpResponse.headers || {};
+    var region = headers['x-amz-bucket-region'] || null;
+    var bucket = req.params.Bucket || null;
+    var bucketRegionCache = req.service.bucketRegionCache;
+    if (region && bucket && region !== bucketRegionCache[bucket]) {
+      bucketRegionCache[bucket] = region;
+    }
+
+    var cachedRegion;
+    if (codes[code] && body.length === 0) {
+      if (bucket && !region) {
+        cachedRegion = bucketRegionCache[bucket] || null;
+        if (cachedRegion !== req.httpRequest.region) {
+          region = cachedRegion;
+        }
+      }
+      resp.error = AWS.util.error(new Error(), {
+        code: codes[code],
+        message: null,
+        region: region
+      });
+    } else {
+      var data = new AWS.XML.Parser().parse(body.toString());
+
+      if (data.Region && !region) {
+        region = data.Region;
+        if (bucket && region !== bucketRegionCache[bucket]) {
+          bucketRegionCache[bucket] = region;
+        }
+      } else if (bucket && !region && !data.Region) {
+        cachedRegion = bucketRegionCache[bucket] || null;
+        if (cachedRegion !== req.httpRequest.region) {
+          region = cachedRegion;
+        }
+      }
+
+      resp.error = AWS.util.error(new Error(), {
+        code: data.Code || code,
+        message: data.Message || null,
+        region: region
+      });
+    }
+    req.service.extractRequestIds(resp);
+  },
+
+  /**
+   * If region was not obtained synchronously, then send async request
+   * to get bucket region for errors resulting from wrong region.
+   *
+   * @api private
+   */
+  requestBucketRegion: function requestBucketRegion(resp, done) {
+    var error = resp.error;
+    var req = resp.request;
+    var bucket = req.params.Bucket || null;
+
+    if (!error || !bucket || error.region || req.operation === 'listObjects' ||
+        (AWS.util.isNode() && req.operation === 'headBucket') ||
+        (error.statusCode === 400 && req.operation !== 'headObject') ||
+        regionRedirectErrorCodes.indexOf(error.code) === -1) {
+      return done();
+    }
+    var reqOperation = AWS.util.isNode() ? 'headBucket' : 'listObjects';
+    var reqParams = {Bucket: bucket};
+    if (reqOperation === 'listObjects') reqParams.MaxKeys = 0;
+    var regionReq = req.service[reqOperation](reqParams);
+    regionReq._requestRegionForBucket = bucket;
+    regionReq.send(function() {
+      var region = req.service.bucketRegionCache[bucket] || null;
+      error.region = region;
+      done();
+    });
+  },
+
+   /**
+   * For browser only. If NetworkingError received, will attempt to obtain
+   * the bucket region.
+   *
+   * @api private
+   */
+   reqRegionForNetworkingError: function reqRegionForNetworkingError(resp, done) {
+    if (!AWS.util.isBrowser()) {
+      return done();
+    }
+    var error = resp.error;
+    var request = resp.request;
+    var bucket = request.params.Bucket;
+    if (!error || error.code !== 'NetworkingError' || !bucket ||
+        request.httpRequest.region === 'us-east-1') {
+      return done();
+    }
+    var service = request.service;
+    var bucketRegionCache = service.bucketRegionCache;
+    var cachedRegion = bucketRegionCache[bucket] || null;
+
+    if (cachedRegion && cachedRegion !== request.httpRequest.region) {
+      service.updateReqBucketRegion(request, cachedRegion);
+      done();
+    } else if (!s3util.dnsCompatibleBucketName(bucket)) {
+      service.updateReqBucketRegion(request, 'us-east-1');
+      if (bucketRegionCache[bucket] !== 'us-east-1') {
+        bucketRegionCache[bucket] = 'us-east-1';
+      }
+      done();
+    } else if (request.httpRequest.virtualHostedBucket) {
+      var getRegionReq = service.listObjects({Bucket: bucket, MaxKeys: 0});
+      service.updateReqBucketRegion(getRegionReq, 'us-east-1');
+      getRegionReq._requestRegionForBucket = bucket;
+
+      getRegionReq.send(function() {
+        var region = service.bucketRegionCache[bucket] || null;
+        if (region && region !== request.httpRequest.region) {
+          service.updateReqBucketRegion(request, region);
+        }
+        done();
+      });
+    } else {
+      // DNS-compatible path-style
+      // (s3ForcePathStyle or bucket name with dot over https)
+      // Cannot obtain region information for this case
+      done();
+    }
+   },
+
+  /**
+   * Cache for bucket region.
+   *
+   * @api private
+   */
+   bucketRegionCache: {},
+
+  /**
+   * Clears bucket region cache.
+   *
+   * @api private
+   */
+   clearBucketRegionCache: function(buckets) {
+    var bucketRegionCache = this.bucketRegionCache;
+    if (!buckets) {
+      buckets = Object.keys(bucketRegionCache);
+    } else if (typeof buckets === 'string') {
+      buckets = [buckets];
+    }
+    for (var i = 0; i < buckets.length; i++) {
+      delete bucketRegionCache[buckets[i]];
+    }
+    return bucketRegionCache;
+   },
+
+   /**
+    * Corrects request region if bucket's cached region is different
+    *
+    * @api private
+    */
+  correctBucketRegionFromCache: function correctBucketRegionFromCache(req) {
+    var bucket = req.params.Bucket || null;
+    if (bucket) {
+      var service = req.service;
+      var requestRegion = req.httpRequest.region;
+      var cachedRegion = service.bucketRegionCache[bucket];
+      if (cachedRegion && cachedRegion !== requestRegion) {
+        service.updateReqBucketRegion(req, cachedRegion);
+      }
+    }
+  },
+
+  /**
+   * Extracts S3 specific request ids from the http response.
+   *
+   * @api private
+   */
+  extractRequestIds: function extractRequestIds(resp) {
+    var extendedRequestId = resp.httpResponse.headers ? resp.httpResponse.headers['x-amz-id-2'] : null;
+    var cfId = resp.httpResponse.headers ? resp.httpResponse.headers['x-amz-cf-id'] : null;
+    resp.extendedRequestId = extendedRequestId;
+    resp.cfId = cfId;
+
+    if (resp.error) {
+      resp.error.requestId = resp.requestId || null;
+      resp.error.extendedRequestId = extendedRequestId;
+      resp.error.cfId = cfId;
+    }
+  },
+
+  /**
+   * Get a pre-signed URL for a given operation name.
+   *
+   * @note You must ensure that you have static or previously resolved
+   *   credentials if you call this method synchronously (with no callback),
+   *   otherwise it may not properly sign the request. If you cannot guarantee
+   *   this (you are using an asynchronous credential provider, i.e., EC2
+   *   IAM roles), you should always call this method with an asynchronous
+   *   callback.
+   * @note Not all operation parameters are supported when using pre-signed
+   *   URLs. Certain parameters, such as `SSECustomerKey`, `ACL`, `Expires`,
+   *   `ContentLength`, or `Tagging` must be provided as headers when sending a
+   *   request. If you are using pre-signed URLs to upload from a browser and
+   *   need to use these fields, see {createPresignedPost}.
+   * @note The default signer allows altering the request by adding corresponding
+   *   headers to set some parameters (e.g. Range) and these added parameters
+   *   won't be signed. You must use signatureVersion v4 to to include these
+   *   parameters in the signed portion of the URL and enforce exact matching
+   *   between headers and signed params in the URL.
+   * @note This operation cannot be used with a promise. See note above regarding
+   *   asynchronous credentials and use with a callback.
+   * @param operation [String] the name of the operation to call
+   * @param params [map] parameters to pass to the operation. See the given
+   *   operation for the expected operation parameters. In addition, you can
+   *   also pass the "Expires" parameter to inform S3 how long the URL should
+   *   work for.
+   * @option params Expires [Integer] (900) the number of seconds to expire
+   *   the pre-signed URL operation in. Defaults to 15 minutes.
+   * @param callback [Function] if a callback is provided, this function will
+   *   pass the URL as the second parameter (after the error parameter) to
+   *   the callback function.
+   * @return [String] if called synchronously (with no callback), returns the
+   *   signed URL.
+   * @return [null] nothing is returned if a callback is provided.
+   * @example Pre-signing a getObject operation (synchronously)
+   *   var params = {Bucket: 'bucket', Key: 'key'};
+   *   var url = s3.getSignedUrl('getObject', params);
+   *   console.log('The URL is', url);
+   * @example Pre-signing a putObject (asynchronously)
+   *   var params = {Bucket: 'bucket', Key: 'key'};
+   *   s3.getSignedUrl('putObject', params, function (err, url) {
+   *     console.log('The URL is', url);
+   *   });
+   * @example Pre-signing a putObject operation with a specific payload
+   *   var params = {Bucket: 'bucket', Key: 'key', Body: 'body'};
+   *   var url = s3.getSignedUrl('putObject', params);
+   *   console.log('The URL is', url);
+   * @example Passing in a 1-minute expiry time for a pre-signed URL
+   *   var params = {Bucket: 'bucket', Key: 'key', Expires: 60};
+   *   var url = s3.getSignedUrl('getObject', params);
+   *   console.log('The URL is', url); // expires in 60 seconds
+   */
+  getSignedUrl: function getSignedUrl(operation, params, callback) {
+    params = AWS.util.copy(params || {});
+    var expires = params.Expires || 900;
+
+    if (typeof expires !== 'number') {
+      throw AWS.util.error(new Error(),
+        { code: 'InvalidParameterException', message: 'The expiration must be a number, received ' + typeof expires });
+    }
+
+    delete params.Expires; // we can't validate this
+    var request = this.makeRequest(operation, params);
+
+    if (callback) {
+      AWS.util.defer(function() {
+        request.presign(expires, callback);
+      });
+    } else {
+      return request.presign(expires, callback);
+    }
+  },
+
+  /**
+   * @!method  getSignedUrlPromise()
+   *   Returns a 'thenable' promise that will be resolved with a pre-signed URL
+   *   for a given operation name.
+   *
+   *   Two callbacks can be provided to the `then` method on the returned promise.
+   *   The first callback will be called if the promise is fulfilled, and the second
+   *   callback will be called if the promise is rejected.
+   *   @note Not all operation parameters are supported when using pre-signed
+   *      URLs. Certain parameters, such as `SSECustomerKey`, `ACL`, `Expires`,
+   *      `ContentLength`, or `Tagging` must be provided as headers when sending a
+   *      request. If you are using pre-signed URLs to upload from a browser and
+   *      need to use these fields, see {createPresignedPost}.
+   *   @param operation [String] the name of the operation to call
+   *   @param params [map] parameters to pass to the operation. See the given
+   *      operation for the expected operation parameters. In addition, you can
+   *      also pass the "Expires" parameter to inform S3 how long the URL should
+   *      work for.
+   *   @option params Expires [Integer] (900) the number of seconds to expire
+   *      the pre-signed URL operation in. Defaults to 15 minutes.
+   *   @callback fulfilledCallback function(url)
+   *     Called if the promise is fulfilled.
+   *     @param url [String] the signed url
+   *   @callback rejectedCallback function(err)
+   *     Called if the promise is rejected.
+   *     @param err [Error] if an error occurred, this value will be filled
+   *   @return [Promise] A promise that represents the state of the `refresh` call.
+   *   @example Pre-signing a getObject operation
+   *      var params = {Bucket: 'bucket', Key: 'key'};
+   *      var promise = s3.getSignedUrlPromise('getObject', params);
+   *      promise.then(function(url) {
+   *        console.log('The URL is', url);
+   *      }, function(err) { ... });
+   *   @example Pre-signing a putObject operation with a specific payload
+   *      var params = {Bucket: 'bucket', Key: 'key', Body: 'body'};
+   *      var promise = s3.getSignedUrlPromise('putObject', params);
+   *      promise.then(function(url) {
+   *        console.log('The URL is', url);
+   *      }, function(err) { ... });
+   *   @example Passing in a 1-minute expiry time for a pre-signed URL
+   *      var params = {Bucket: 'bucket', Key: 'key', Expires: 60};
+   *      var promise = s3.getSignedUrlPromise('getObject', params);
+   *      promise.then(function(url) {
+   *        console.log('The URL is', url);
+   *      }, function(err) { ... });
+   */
+
+  /**
+   * Get a pre-signed POST policy to support uploading to S3 directly from an
+   * HTML form.
+   *
+   * @param params [map]
+   * @option params Bucket [String]     The bucket to which the post should be
+   *                                    uploaded
+   * @option params Expires [Integer]   (3600) The number of seconds for which
+   *                                    the presigned policy should be valid.
+   * @option params Conditions [Array]  An array of conditions that must be met
+   *                                    for the presigned policy to allow the
+   *                                    upload. This can include required tags,
+   *                                    the accepted range for content lengths,
+   *                                    etc.
+   * @see http://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-HTTPPOSTConstructPolicy.html
+   * @option params Fields [map]        Fields to include in the form. All
+   *                                    values passed in as fields will be
+   *                                    signed as exact match conditions.
+   * @param callback [Function]
+   *
+   * @note All fields passed in when creating presigned post data will be signed
+   *   as exact match conditions. Any fields that will be interpolated by S3
+   *   must be added to the fields hash after signing, and an appropriate
+   *   condition for such fields must be explicitly added to the Conditions
+   *   array passed to this function before signing.
+   *
+   * @example Presiging post data with a known key
+   *   var params = {
+   *     Bucket: 'bucket',
+   *     Fields: {
+   *       key: 'key'
+   *     }
+   *   };
+   *   s3.createPresignedPost(params, function(err, data) {
+   *     if (err) {
+   *       console.error('Presigning post data encountered an error', err);
+   *     } else {
+   *       console.log('The post data is', data);
+   *     }
+   *   });
+   *
+   * @example Presigning post data with an interpolated key
+   *   var params = {
+   *     Bucket: 'bucket',
+   *     Conditions: [
+   *       ['starts-with', '$key', 'path/to/uploads/']
+   *     ]
+   *   };
+   *   s3.createPresignedPost(params, function(err, data) {
+   *     if (err) {
+   *       console.error('Presigning post data encountered an error', err);
+   *     } else {
+   *       data.Fields.key = 'path/to/uploads/${filename}';
+   *       console.log('The post data is', data);
+   *     }
+   *   });
+   *
+   * @note You must ensure that you have static or previously resolved
+   *   credentials if you call this method synchronously (with no callback),
+   *   otherwise it may not properly sign the request. If you cannot guarantee
+   *   this (you are using an asynchronous credential provider, i.e., EC2
+   *   IAM roles), you should always call this method with an asynchronous
+   *   callback.
+   *
+   * @return [map]  If called synchronously (with no callback), returns a hash
+   *                with the url to set as the form action and a hash of fields
+   *                to include in the form.
+   * @return [null] Nothing is returned if a callback is provided.
+   *
+   * @callback callback function (err, data)
+   *  @param err [Error] the error object returned from the policy signer
+   *  @param data [map] The data necessary to construct an HTML form
+   *  @param data.url [String] The URL to use as the action of the form
+   *  @param data.fields [map] A hash of fields that must be included in the
+   *                           form for the upload to succeed. This hash will
+   *                           include the signed POST policy, your access key
+   *                           ID and security token (if present), etc. These
+   *                           may be safely included as input elements of type
+   *                           'hidden.'
+   */
+  createPresignedPost: function createPresignedPost(params, callback) {
+    if (typeof params === 'function' && callback === undefined) {
+      callback = params;
+      params = null;
+    }
+
+    params = AWS.util.copy(params || {});
+    var boundParams = this.config.params || {};
+    var bucket = params.Bucket || boundParams.Bucket,
+      self = this,
+      config = this.config,
+      endpoint = AWS.util.copy(this.endpoint);
+    if (!config.s3BucketEndpoint) {
+      endpoint.pathname = '/' + bucket;
+    }
+
+    function finalizePost() {
+      return {
+        url: AWS.util.urlFormat(endpoint),
+        fields: self.preparePostFields(
+          config.credentials,
+          config.region,
+          bucket,
+          params.Fields,
+          params.Conditions,
+          params.Expires
+        )
+      };
+    }
+
+    if (callback) {
+      config.getCredentials(function (err) {
+        if (err) {
+          callback(err);
+        } else {
+          try {
+            callback(null, finalizePost());
+          } catch (err) {
+            callback(err);
+          }
+        }
+      });
+    } else {
+      return finalizePost();
+    }
+  },
+
+  /**
+   * @api private
+   */
+  preparePostFields: function preparePostFields(
+    credentials,
+    region,
+    bucket,
+    fields,
+    conditions,
+    expiresInSeconds
+  ) {
+    var now = this.getSkewCorrectedDate();
+    if (!credentials || !region || !bucket) {
+      throw new Error('Unable to create a POST object policy without a bucket,'
+        + ' region, and credentials');
+    }
+    fields = AWS.util.copy(fields || {});
+    conditions = (conditions || []).slice(0);
+    expiresInSeconds = expiresInSeconds || 3600;
+
+    var signingDate = AWS.util.date.iso8601(now).replace(/[:\-]|\.\d{3}/g, '');
+    var shortDate = signingDate.substr(0, 8);
+    var scope = v4Credentials.createScope(shortDate, region, 's3');
+    var credential = credentials.accessKeyId + '/' + scope;
+
+    fields['bucket'] = bucket;
+    fields['X-Amz-Algorithm'] = 'AWS4-HMAC-SHA256';
+    fields['X-Amz-Credential'] = credential;
+    fields['X-Amz-Date'] = signingDate;
+    if (credentials.sessionToken) {
+      fields['X-Amz-Security-Token'] = credentials.sessionToken;
+    }
+    for (var field in fields) {
+      if (fields.hasOwnProperty(field)) {
+        var condition = {};
+        condition[field] = fields[field];
+        conditions.push(condition);
+      }
+    }
+
+    fields.Policy = this.preparePostPolicy(
+      new Date(now.valueOf() + expiresInSeconds * 1000),
+      conditions
+    );
+    fields['X-Amz-Signature'] = AWS.util.crypto.hmac(
+      v4Credentials.getSigningKey(credentials, shortDate, region, 's3', true),
+      fields.Policy,
+      'hex'
+    );
+
+    return fields;
+  },
+
+  /**
+   * @api private
+   */
+  preparePostPolicy: function preparePostPolicy(expiration, conditions) {
+    return AWS.util.base64.encode(JSON.stringify({
+      expiration: AWS.util.date.iso8601(expiration),
+      conditions: conditions
+    }));
+  },
+
+  /**
+   * @api private
+   */
+  prepareSignedUrl: function prepareSignedUrl(request) {
+    request.addListener('validate', request.service.noPresignedContentLength);
+    request.removeListener('build', request.service.addContentType);
+    if (!request.params.Body) {
+      // no Content-MD5/SHA-256 if body is not provided
+      request.removeListener('build', request.service.computeContentMd5);
+    } else {
+      request.addListener('afterBuild', AWS.EventListeners.Core.COMPUTE_SHA256);
+    }
+  },
+
+  /**
+   * @api private
+   * @param request
+   */
+  disableBodySigning: function disableBodySigning(request) {
+    var headers = request.httpRequest.headers;
+    // Add the header to anything that isn't a presigned url, unless that presigned url had a body defined
+    if (!Object.prototype.hasOwnProperty.call(headers, 'presigned-expires')) {
+      headers['X-Amz-Content-Sha256'] = 'UNSIGNED-PAYLOAD';
+    }
+  },
+
+  /**
+   * @api private
+   */
+  noPresignedContentLength: function noPresignedContentLength(request) {
+    if (request.params.ContentLength !== undefined) {
+      throw AWS.util.error(new Error(), {code: 'UnexpectedParameter',
+        message: 'ContentLength is not supported in pre-signed URLs.'});
+    }
+  },
+
+  createBucket: function createBucket(params, callback) {
+    // When creating a bucket *outside* the classic region, the location
+    // constraint must be set for the bucket and it must match the endpoint.
+    // This chunk of code will set the location constraint param based
+    // on the region (when possible), but it will not override a passed-in
+    // location constraint.
+    if (typeof params === 'function' || !params) {
+      callback = callback || params;
+      params = {};
+    }
+    var hostname = this.endpoint.hostname;
+    // copy params so that appending keys does not unintentioinallly
+    // mutate params object argument passed in by user
+    var copiedParams = AWS.util.copy(params);
+
+    if (hostname !== this.api.globalEndpoint && !params.CreateBucketConfiguration) {
+      copiedParams.CreateBucketConfiguration = { LocationConstraint: this.config.region };
+    }
+    return this.makeRequest('createBucket', copiedParams, callback);
+  },
+
+  writeGetObjectResponse: function writeGetObjectResponse(params, callback) {
+
+    var request = this.makeRequest('writeGetObjectResponse', AWS.util.copy(params), callback);
+    var hostname = this.endpoint.hostname;
+    if (hostname.indexOf(this.config.region) !== -1) {
+      // hostname specifies a region already
+      hostname = hostname.replace('s3.', OBJECT_LAMBDA_SERVICE + '.');
+    } else {
+      // Hostname doesn't have a region.
+      // Object Lambda requires an explicit region.
+      hostname = hostname.replace('s3.', OBJECT_LAMBDA_SERVICE + '.' + this.config.region + '.');
+    }
+
+    request.httpRequest.endpoint = new AWS.Endpoint(hostname, this.config);
+    return request;
+  },
+
+  /**
+   * @see AWS.S3.ManagedUpload
+   * @overload upload(params = {}, [options], [callback])
+   *   Uploads an arbitrarily sized buffer, blob, or stream, using intelligent
+   *   concurrent handling of parts if the payload is large enough. You can
+   *   configure the concurrent queue size by setting `options`. Note that this
+   *   is the only operation for which the SDK can retry requests with stream
+   *   bodies.
+   *
+   *   @param (see AWS.S3.putObject)
+   *   @option (see AWS.S3.ManagedUpload.constructor)
+   *   @return [AWS.S3.ManagedUpload] the managed upload object that can call
+   *     `send()` or track progress.
+   *   @example Uploading a stream object
+   *     var params = {Bucket: 'bucket', Key: 'key', Body: stream};
+   *     s3.upload(params, function(err, data) {
+   *       console.log(err, data);
+   *     });
+   *   @example Uploading a stream with concurrency of 1 and partSize of 10mb
+   *     var params = {Bucket: 'bucket', Key: 'key', Body: stream};
+   *     var options = {partSize: 10 * 1024 * 1024, queueSize: 1};
+   *     s3.upload(params, options, function(err, data) {
+   *       console.log(err, data);
+   *     });
+   * @callback callback function(err, data)
+   *   @param err [Error] an error or null if no error occurred.
+   *   @param data [map] The response data from the successful upload:
+   *   @param data.Location [String] the URL of the uploaded object
+   *   @param data.ETag [String] the ETag of the uploaded object
+   *   @param data.Bucket [String]  the bucket to which the object was uploaded
+   *   @param data.Key [String] the key to which the object was uploaded
+   */
+  upload: function upload(params, options, callback) {
+    if (typeof options === 'function' && callback === undefined) {
+      callback = options;
+      options = null;
+    }
+
+    options = options || {};
+    options = AWS.util.merge(options || {}, {service: this, params: params});
+
+    var uploader = new AWS.S3.ManagedUpload(options);
+    if (typeof callback === 'function') uploader.send(callback);
+    return uploader;
+  }
+});
+
+/**
+ * @api private
+ */
+AWS.S3.addPromisesToClass = function addPromisesToClass(PromiseDependency) {
+  this.prototype.getSignedUrlPromise = AWS.util.promisifyMethod('getSignedUrl', PromiseDependency);
+};
+
+/**
+ * @api private
+ */
+AWS.S3.deletePromisesFromClass = function deletePromisesFromClass() {
+  delete this.prototype.getSignedUrlPromise;
+};
+
+AWS.util.addPromises(AWS.S3);
+
+
+/***/ }),
 /* 159 */,
-/* 160 */,
+/* 160 */
+/***/ (function(module) {
+
+var ENV_ENDPOINT_NAME = 'AWS_EC2_METADATA_SERVICE_ENDPOINT';
+var CONFIG_ENDPOINT_NAME = 'ec2_metadata_service_endpoint';
+
+var getEndpointConfigOptions = function() {
+  return {
+    environmentVariableSelector: function(env) { return env[ENV_ENDPOINT_NAME]; },
+    configFileSelector: function(profile) { return profile[CONFIG_ENDPOINT_NAME]; },
+    default: undefined,
+  };
+};
+
+module.exports = getEndpointConfigOptions;
+
+
+/***/ }),
 /* 161 */,
 /* 162 */,
 /* 163 */,
@@ -3254,7 +4479,7 @@ module.exports = apiLoader;
 
 var AWS = __webpack_require__(395);
 var CognitoIdentity = __webpack_require__(214);
-var STS = __webpack_require__(733);
+var STS = __webpack_require__(106);
 
 /**
  * Represents credentials retrieved from STS Web Identity Federation using
@@ -3641,22 +4866,29 @@ AWS.CognitoIdentityCredentials = AWS.util.inherit(AWS.Credentials, {
 
 /***/ }),
 /* 171 */
-/***/ (function(__unusedmodule, exports) {
+/***/ (function(module) {
 
-"use strict";
+function isFipsRegion(region) {
+  return typeof region === 'string' && (region.startsWith('fips-') || region.endsWith('-fips'));
+}
 
-Object.defineProperty(exports, "__esModule", { value: true });
-const NODE_PROCESS_VERSION_PARTS = process.versions.node.split('.');
-const MAJOR_VERSION = parseInt(NODE_PROCESS_VERSION_PARTS[0], 10);
-const MINOR_VERSION = parseInt(NODE_PROCESS_VERSION_PARTS[1], 10);
-const SUPPORTED_MAJOR_VERSION = 10;
-const SUPPORTED_MINOR_VERSION = 10;
-const IS_MATCHED_BY_MAJOR = MAJOR_VERSION > SUPPORTED_MAJOR_VERSION;
-const IS_MATCHED_BY_MAJOR_AND_MINOR = MAJOR_VERSION === SUPPORTED_MAJOR_VERSION && MINOR_VERSION >= SUPPORTED_MINOR_VERSION;
-/**
- * IS `true` for Node.js 10.10 and greater.
- */
-exports.IS_SUPPORT_READDIR_WITH_FILE_TYPES = IS_MATCHED_BY_MAJOR || IS_MATCHED_BY_MAJOR_AND_MINOR;
+function isGlobalRegion(region) {
+  return typeof region === 'string' && ['aws-global', 'aws-us-gov-global'].includes(region);
+}
+
+function getRealRegion(region) {
+  return ['fips-aws-global', 'aws-fips', 'aws-global'].includes(region)
+      ? 'us-east-1'
+      : ['fips-aws-us-gov-global', 'aws-us-gov-global'].includes(region)
+      ? 'us-gov-west-1'
+      : region.replace(/fips-(dkr-|prod-)?|-fips/, '');
+}
+
+module.exports = {
+  isFipsRegion: isFipsRegion,
+  isGlobalRegion: isGlobalRegion,
+  getRealRegion: getRealRegion
+};
 
 
 /***/ }),
@@ -3740,7 +4972,73 @@ module.exports = {
 
 /***/ }),
 /* 176 */,
-/* 177 */,
+/* 177 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.checkBypass = exports.getProxyUrl = void 0;
+function getProxyUrl(reqUrl) {
+    const usingSsl = reqUrl.protocol === 'https:';
+    if (checkBypass(reqUrl)) {
+        return undefined;
+    }
+    const proxyVar = (() => {
+        if (usingSsl) {
+            return process.env['https_proxy'] || process.env['HTTPS_PROXY'];
+        }
+        else {
+            return process.env['http_proxy'] || process.env['HTTP_PROXY'];
+        }
+    })();
+    if (proxyVar) {
+        return new URL(proxyVar);
+    }
+    else {
+        return undefined;
+    }
+}
+exports.getProxyUrl = getProxyUrl;
+function checkBypass(reqUrl) {
+    if (!reqUrl.hostname) {
+        return false;
+    }
+    const noProxy = process.env['no_proxy'] || process.env['NO_PROXY'] || '';
+    if (!noProxy) {
+        return false;
+    }
+    // Determine the request port
+    let reqPort;
+    if (reqUrl.port) {
+        reqPort = Number(reqUrl.port);
+    }
+    else if (reqUrl.protocol === 'http:') {
+        reqPort = 80;
+    }
+    else if (reqUrl.protocol === 'https:') {
+        reqPort = 443;
+    }
+    // Format the request hostname and hostname with port
+    const upperReqHosts = [reqUrl.hostname.toUpperCase()];
+    if (typeof reqPort === 'number') {
+        upperReqHosts.push(`${upperReqHosts[0]}:${reqPort}`);
+    }
+    // Compare request host against noproxy
+    for (const upperNoProxyItem of noProxy
+        .split(',')
+        .map(x => x.trim().toUpperCase())
+        .filter(x => x)) {
+        if (upperReqHosts.some(x => x === upperNoProxyItem)) {
+            return true;
+        }
+    }
+    return false;
+}
+exports.checkBypass = checkBypass;
+//# sourceMappingURL=proxy.js.map
+
+/***/ }),
 /* 178 */,
 /* 179 */,
 /* 180 */,
@@ -3751,9 +5049,9 @@ module.exports = {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", { value: true });
-const fsStat = __webpack_require__(858);
+const fsStat = __webpack_require__(109);
 const rpl = __webpack_require__(934);
-const constants_1 = __webpack_require__(171);
+const constants_1 = __webpack_require__(900);
 const utils = __webpack_require__(933);
 function read(directory, settings, callback) {
     if (!settings.stats && constants_1.IS_SUPPORT_READDIR_WITH_FILE_TYPES) {
@@ -3905,7 +5203,7 @@ var PromisesDependency;
  *
  * @!attribute computeChecksums
  *   @return [Boolean] whether to compute checksums for payload bodies when
- *     the service accepts it (currently supported in S3 only).
+ *     the service accepts it (currently supported in S3 and SQS only).
  *
  * @!attribute convertResponseTypes
  *   @return [Boolean] whether types are converted when parsing response data.
@@ -3968,7 +5266,7 @@ var PromisesDependency;
  *       retry count and error and returns the amount of time to delay in
  *       milliseconds. If the result is a non-zero negative value, no further
  *       retry attempts will be made. The `base` option will be ignored if this
- *       option is supplied.
+ *       option is supplied. The function is only called for retryable errors.
  *
  * @!attribute httpOptions
  *   @return [map] A set of options to pass to the low-level HTTP request.
@@ -3984,9 +5282,9 @@ var PromisesDependency;
  *       failing to establish a connection with the server after
  *       `connectTimeout` milliseconds. This timeout has no effect once a socket
  *       connection has been established.
- *     * **timeout** [Integer] &mdash; Sets the socket to timeout after timeout
- *       milliseconds of inactivity on the socket. Defaults to two minutes
- *       (120000)
+ *     * **timeout** [Integer] &mdash; The number of milliseconds a request can
+ *       take before automatically being terminated.
+ *       Defaults to two minutes (120000).
  *     * **xhrAsync** [Boolean] &mdash; Whether the SDK will send asynchronous
  *       HTTP requests. Used in the browser environment only. Set to false to
  *       send requests synchronously. Defaults to true (async on).
@@ -4036,7 +5334,13 @@ var PromisesDependency;
  * @!attribute stsRegionalEndpoints
  *   @return ['legacy'|'regional'] whether to send sts request to global endpoints or
  *     regional endpoints.
- *     Defaults to 'legacy'
+ *     Defaults to 'legacy'.
+ *
+ * @!attribute useFipsEndpoint
+ *   @return [Boolean] Enables FIPS compatible endpoints. Defaults to `false`.
+ *
+ * @!attribute useDualstackEndpoint
+ *   @return [Boolean] Enables IPv6 dualstack endpoint. Defaults to `false`.
  */
 AWS.Config = AWS.util.inherit({
   /**
@@ -4121,7 +5425,7 @@ AWS.Config = AWS.util.inherit({
    *     retry count and error and returns the amount of time to delay in
    *     milliseconds. If the result is a non-zero negative value, no further
    *     retry attempts will be made. The `base` option will be ignored if this
-   *     option is supplied.
+   *     option is supplied. The function is only called for retryable errors.
    * @option options httpOptions [map] A set of options to pass to the low-level
    *   HTTP request. Currently supported options are:
    *
@@ -4191,6 +5495,10 @@ AWS.Config = AWS.util.inherit({
    * @option options stsRegionalEndpoints ['legacy'|'regional'] whether to send sts request
    *   to global endpoints or regional endpoints.
    *   Defaults to 'legacy'.
+   * @option options useFipsEndpoint [Boolean] Enables FIPS compatible endpoints.
+   *   Defaults to `false`.
+   * @option options useDualstackEndpoint [Boolean] Enables IPv6 dualstack endpoint.
+   *   Defaults to `false`.
    */
   constructor: function Config(options) {
     if (options === undefined) options = {};
@@ -4280,6 +5588,82 @@ AWS.Config = AWS.util.inherit({
       });
     } else {
       finish(credError('No credentials to load'));
+    }
+  },
+
+  /**
+   * Loads token from the configuration object. This is used internally
+   * by the SDK to ensure that refreshable {Token} objects are properly
+   * refreshed and loaded when sending a request. If you want to ensure that
+   * your token is loaded prior to a request, you can use this method
+   * directly to provide accurate token data stored in the object.
+   *
+   * @note If you configure the SDK with static token, the token data should
+   *   already be present in {token} attribute. This method is primarily necessary
+   *   to load token from asynchronous sources, or sources that can refresh
+   *   token periodically.
+   * @example Getting your access token
+   *   AWS.config.getToken(function(err) {
+   *     if (err) console.log(err.stack); // token not loaded
+   *     else console.log("Token:", AWS.config.token.token);
+   *   })
+   * @callback callback function(err)
+   *   Called when the {token} have been properly set on the configuration object.
+   *
+   *   @param err [Error] if this is set, token was not successfully loaded and
+   *     this error provides information why.
+   * @see token
+   */
+  getToken: function getToken(callback) {
+    var self = this;
+
+    function finish(err) {
+      callback(err, err ? null : self.token);
+    }
+
+    function tokenError(msg, err) {
+      return new AWS.util.error(err || new Error(), {
+        code: 'TokenError',
+        message: msg,
+        name: 'TokenError'
+      });
+    }
+
+    function getAsyncToken() {
+      self.token.get(function(err) {
+        if (err) {
+          var msg = 'Could not load token from ' +
+            self.token.constructor.name;
+          err = tokenError(msg, err);
+        }
+        finish(err);
+      });
+    }
+
+    function getStaticToken() {
+      var err = null;
+      if (!self.token.token) {
+        err = tokenError('Missing token');
+      }
+      finish(err);
+    }
+
+    if (self.token) {
+      if (typeof self.token.get === 'function') {
+        getAsyncToken();
+      } else { // static token
+        getStaticToken();
+      }
+    } else if (self.tokenProvider) {
+      self.tokenProvider.resolve(function(err, token) {
+        if (err) {
+          err = tokenError('Could not load token from any providers', err);
+        }
+        self.token = token;
+        finish(err);
+      });
+    } else {
+      finish(tokenError('No token to load'));
     }
   },
 
@@ -4414,7 +5798,10 @@ AWS.Config = AWS.util.inherit({
     endpointDiscoveryEnabled: undefined,
     endpointCacheSize: 1000,
     hostPrefixEnabled: true,
-    stsRegionalEndpoints: 'legacy'
+    stsRegionalEndpoints: 'legacy',
+    useFipsEndpoint: false,
+    useDualstackEndpoint: false,
+    token: null
   },
 
   /**
@@ -4681,12 +6068,83 @@ module.exports = require("dgram");
 /* 201 */,
 /* 202 */,
 /* 203 */,
-/* 204 */,
+/* 204 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _validate = _interopRequireDefault(__webpack_require__(634));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function parse(uuid) {
+  if (!(0, _validate.default)(uuid)) {
+    throw TypeError('Invalid UUID');
+  }
+
+  let v;
+  const arr = new Uint8Array(16); // Parse ########-....-....-....-............
+
+  arr[0] = (v = parseInt(uuid.slice(0, 8), 16)) >>> 24;
+  arr[1] = v >>> 16 & 0xff;
+  arr[2] = v >>> 8 & 0xff;
+  arr[3] = v & 0xff; // Parse ........-####-....-....-............
+
+  arr[4] = (v = parseInt(uuid.slice(9, 13), 16)) >>> 8;
+  arr[5] = v & 0xff; // Parse ........-....-####-....-............
+
+  arr[6] = (v = parseInt(uuid.slice(14, 18), 16)) >>> 8;
+  arr[7] = v & 0xff; // Parse ........-....-....-####-............
+
+  arr[8] = (v = parseInt(uuid.slice(19, 23), 16)) >>> 8;
+  arr[9] = v & 0xff; // Parse ........-....-....-....-############
+  // (Use "/" to avoid 32-bit truncation when bit-shifting high-order bytes)
+
+  arr[10] = (v = parseInt(uuid.slice(24, 36), 16)) / 0x10000000000 & 0xff;
+  arr[11] = v / 0x100000000 & 0xff;
+  arr[12] = v >>> 24 & 0xff;
+  arr[13] = v >>> 16 & 0xff;
+  arr[14] = v >>> 8 & 0xff;
+  arr[15] = v & 0xff;
+  return arr;
+}
+
+var _default = parse;
+exports.default = _default;
+
+/***/ }),
 /* 205 */,
 /* 206 */,
 /* 207 */,
 /* 208 */,
-/* 209 */,
+/* 209 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _v = _interopRequireDefault(__webpack_require__(212));
+
+var _md = _interopRequireDefault(__webpack_require__(803));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+const v3 = (0, _v.default)('v3', 0x30, _md.default);
+var _default = v3;
+exports.default = _default;
+
+/***/ }),
 /* 210 */
 /***/ (function(__unusedmodule, exports) {
 
@@ -4711,7 +6169,81 @@ module.exports = require("dgram");
 module.exports = require("https");
 
 /***/ }),
-/* 212 */,
+/* 212 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = _default;
+exports.URL = exports.DNS = void 0;
+
+var _bytesToUuid = _interopRequireDefault(__webpack_require__(390));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function uuidToBytes(uuid) {
+  // Note: We assume we're being passed a valid uuid string
+  var bytes = [];
+  uuid.replace(/[a-fA-F0-9]{2}/g, function (hex) {
+    bytes.push(parseInt(hex, 16));
+  });
+  return bytes;
+}
+
+function stringToBytes(str) {
+  str = unescape(encodeURIComponent(str)); // UTF8 escape
+
+  var bytes = new Array(str.length);
+
+  for (var i = 0; i < str.length; i++) {
+    bytes[i] = str.charCodeAt(i);
+  }
+
+  return bytes;
+}
+
+const DNS = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
+exports.DNS = DNS;
+const URL = '6ba7b811-9dad-11d1-80b4-00c04fd430c8';
+exports.URL = URL;
+
+function _default(name, version, hashfunc) {
+  var generateUUID = function (value, namespace, buf, offset) {
+    var off = buf && offset || 0;
+    if (typeof value == 'string') value = stringToBytes(value);
+    if (typeof namespace == 'string') namespace = uuidToBytes(namespace);
+    if (!Array.isArray(value)) throw TypeError('value must be an array of bytes');
+    if (!Array.isArray(namespace) || namespace.length !== 16) throw TypeError('namespace must be uuid string or an Array of 16 byte values'); // Per 4.3
+
+    var bytes = hashfunc(namespace.concat(value));
+    bytes[6] = bytes[6] & 0x0f | version;
+    bytes[8] = bytes[8] & 0x3f | 0x80;
+
+    if (buf) {
+      for (var idx = 0; idx < 16; ++idx) {
+        buf[off + idx] = bytes[idx];
+      }
+    }
+
+    return buf || (0, _bytesToUuid.default)(bytes);
+  }; // Function#name is not settable on some platforms (#270)
+
+
+  try {
+    generateUUID.name = name;
+  } catch (err) {} // For CommonJS default export support
+
+
+  generateUUID.DNS = DNS;
+  generateUUID.URL = URL;
+  return generateUUID;
+}
+
+/***/ }),
 /* 213 */
 /***/ (function(module) {
 
@@ -4728,7 +6260,6 @@ var apiLoader = AWS.apiLoader;
 
 apiLoader.services['cognitoidentity'] = {};
 AWS.CognitoIdentity = Service.defineService('cognitoidentity', ['2014-06-30']);
-__webpack_require__(382);
 Object.defineProperty(apiLoader.services['cognitoidentity'], '2014-06-30', {
   get: function get() {
     var model = __webpack_require__(56);
@@ -5103,7 +6634,7 @@ exports.flatten = (...args) => {
 "use strict";
 
 
-const stringify = __webpack_require__(326);
+const stringify = __webpack_require__(382);
 
 /**
  * Constants
@@ -5444,7 +6975,55 @@ module.exports = parse;
 module.exports = require("domain");
 
 /***/ }),
-/* 230 */,
+/* 230 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+"use strict";
+
+
+var isGlob = __webpack_require__(486);
+var pathPosixDirname = __webpack_require__(622).posix.dirname;
+var isWin32 = __webpack_require__(87).platform() === 'win32';
+
+var slash = '/';
+var backslash = /\\/g;
+var enclosure = /[\{\[].*[\}\]]$/;
+var globby = /(^|[^\\])([\{\[]|\([^\)]+$)/;
+var escaped = /\\([\!\*\?\|\[\]\(\)\{\}])/g;
+
+/**
+ * @param {string} str
+ * @param {Object} opts
+ * @param {boolean} [opts.flipBackslashes=true]
+ * @returns {string}
+ */
+module.exports = function globParent(str, opts) {
+  var options = Object.assign({ flipBackslashes: true }, opts);
+
+  // flip windows path separators
+  if (options.flipBackslashes && isWin32 && str.indexOf(slash) < 0) {
+    str = str.replace(backslash, slash);
+  }
+
+  // special case for strings ending in enclosure containing path separator
+  if (enclosure.test(str)) {
+    str += slash;
+  }
+
+  // preserves full path in case of trailing path separator
+  str += 'a';
+
+  // remove path parts that are globby
+  do {
+    str = pathPosixDirname(str);
+  } while (isGlob(str) || globby.test(str));
+
+  // remove escape chars and return result
+  return str.replace(escaped, '$1');
+};
+
+
+/***/ }),
 /* 231 */
 /***/ (function(__unusedmodule, exports) {
 
@@ -5553,14 +7132,18 @@ module.exports = resolveRegionalEndpointsFlag;
 
 var util = __webpack_require__(954);
 
+var region_utils = __webpack_require__(171);
+var isFipsRegion = region_utils.isFipsRegion;
+var getRealRegion = region_utils.getRealRegion;
+
 util.isBrowser = function() { return false; };
 util.isNode = function() { return true; };
 
 // node.js specific modules
 util.crypto.lib = __webpack_require__(417);
-util.Buffer = __webpack_require__(293).Buffer;
+util.Buffer = __webpack_require__(407).Buffer;
 util.domain = __webpack_require__(229);
-util.stream = __webpack_require__(413);
+util.stream = __webpack_require__(794);
 util.url = __webpack_require__(414);
 util.querystring = __webpack_require__(191);
 util.environment = 'nodejs';
@@ -5572,6 +7155,34 @@ util.clientSideMonitoring = {
   configProvider: __webpack_require__(762),
 };
 util.iniLoader = __webpack_require__(892).iniLoader;
+util.getSystemErrorName = __webpack_require__(669).getSystemErrorName;
+
+util.loadConfig = function(options) {
+  var envValue = options.environmentVariableSelector(process.env);
+  if (envValue !== undefined) {
+    return envValue;
+  }
+
+  var configFile = {};
+  try {
+    configFile = util.iniLoader ? util.iniLoader.loadFrom({
+      isConfig: true,
+      filename: process.env[util.sharedConfigFileEnv]
+    }) : {};
+  } catch (e) {}
+  var sharedFileConfig = configFile[
+    process.env.AWS_PROFILE || util.defaultProfile
+  ] || {};
+  var configValue = options.configFileSelector(sharedFileConfig);
+  if (configValue !== undefined) {
+    return configValue;
+  }
+
+  if (typeof options.default === 'function') {
+    return options.default();
+  }
+  return options.default;
+};
 
 var AWS;
 
@@ -5590,7 +7201,7 @@ __webpack_require__(966);
 __webpack_require__(982);
 
 // Load the xml2js XML parser
-AWS.XML.Parser = __webpack_require__(810);
+AWS.XML.Parser = __webpack_require__(763);
 
 // Load Node HTTP client
 __webpack_require__(888);
@@ -5603,23 +7214,86 @@ __webpack_require__(103);
 __webpack_require__(426);
 __webpack_require__(316);
 __webpack_require__(872);
-__webpack_require__(634);
+__webpack_require__(745);
 __webpack_require__(22);
 __webpack_require__(982);
+__webpack_require__(114);
 
-// Setup default chain providers
+// Setup default providers for credentials chain
 // If this changes, please update documentation for
 // AWS.CredentialProviderChain.defaultProviders in
 // credentials/credential_provider_chain.js
 AWS.CredentialProviderChain.defaultProviders = [
   function () { return new AWS.EnvironmentCredentials('AWS'); },
   function () { return new AWS.EnvironmentCredentials('AMAZON'); },
+  function () { return new AWS.SsoCredentials(); },
   function () { return new AWS.SharedIniFileCredentials(); },
   function () { return new AWS.ECSCredentials(); },
   function () { return new AWS.ProcessCredentials(); },
   function () { return new AWS.TokenFileWebIdentityCredentials(); },
   function () { return new AWS.EC2MetadataCredentials(); }
 ];
+
+// Load custom token providers
+__webpack_require__(154);
+__webpack_require__(115);
+__webpack_require__(858);
+
+// Setup default providers for token chain
+// If this changes, please update documentation for
+// AWS.TokenProviderChain.defaultProviders in
+// token/token_provider_chain.js
+AWS.TokenProviderChain.defaultProviders = [
+  function () { return new AWS.SSOTokenProvider(); },
+];
+
+var getRegion = function() {
+  var env = process.env;
+  var region = env.AWS_REGION || env.AMAZON_REGION;
+  if (env[AWS.util.configOptInEnv]) {
+    var toCheck = [
+      {filename: env[AWS.util.sharedCredentialsFileEnv]},
+      {isConfig: true, filename: env[AWS.util.sharedConfigFileEnv]}
+    ];
+    var iniLoader = AWS.util.iniLoader;
+    while (!region && toCheck.length) {
+      var configFile = {};
+      var fileInfo = toCheck.shift();
+      try {
+        configFile = iniLoader.loadFrom(fileInfo);
+      } catch (err) {
+        if (fileInfo.isConfig) throw err;
+      }
+      var profile = configFile[env.AWS_PROFILE || AWS.util.defaultProfile];
+      region = profile && profile.region;
+    }
+  }
+  return region;
+};
+
+var getBooleanValue = function(value) {
+  return value === 'true' ? true: value === 'false' ? false: undefined;
+};
+
+var USE_FIPS_ENDPOINT_CONFIG_OPTIONS = {
+  environmentVariableSelector: function(env) {
+    return getBooleanValue(env['AWS_USE_FIPS_ENDPOINT']);
+  },
+  configFileSelector: function(profile) {
+    return getBooleanValue(profile['use_fips_endpoint']);
+  },
+  default: false,
+};
+
+var USE_DUALSTACK_ENDPOINT_CONFIG_OPTIONS = {
+  environmentVariableSelector: function(env) {
+    return getBooleanValue(env['AWS_USE_DUALSTACK_ENDPOINT']);
+  },
+  configFileSelector: function(profile) {
+    return getBooleanValue(profile['use_dualstack_endpoint']);
+  },
+  default: false,
+};
 
 // Update configuration keys
 AWS.util.update(AWS.Config.prototype.keys, {
@@ -5641,21 +7315,20 @@ AWS.util.update(AWS.Config.prototype.keys, {
     return process.env.AWSJS_DEBUG ? console : null;
   },
   region: function() {
-    var env = process.env;
-    var region = env.AWS_REGION || env.AMAZON_REGION;
-    if (env[AWS.util.configOptInEnv]) {
-      var toCheck = [
-        {filename: env[AWS.util.sharedCredentialsFileEnv]},
-        {isConfig: true, filename: env[AWS.util.sharedConfigFileEnv]}
-      ];
-      var iniLoader = AWS.util.iniLoader;
-      while (!region && toCheck.length) {
-        var configFile = iniLoader.loadFrom(toCheck.shift());
-        var profile = configFile[env.AWS_PROFILE || AWS.util.defaultProfile];
-        region = profile && profile.region;
-      }
-    }
-    return region;
+    var region = getRegion();
+    return region ? getRealRegion(region): undefined;
+  },
+  tokenProvider: function() {
+    return new AWS.TokenProviderChain();
+  },
+  useFipsEndpoint: function() {
+    var region = getRegion();
+    return isFipsRegion(region)
+      ? true
+      : util.loadConfig(USE_FIPS_ENDPOINT_CONFIG_OPTIONS);
+  },
+  useDualstackEndpoint: function() {
+    return util.loadConfig(USE_DUALSTACK_ENDPOINT_CONFIG_OPTIONS);
   }
 });
 
@@ -5726,7 +7399,26 @@ module.exports = Paginator;
 /* 270 */,
 /* 271 */,
 /* 272 */,
-/* 273 */,
+/* 273 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+var EndpointMode = __webpack_require__(587)();
+
+var ENV_ENDPOINT_MODE_NAME = 'AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE';
+var CONFIG_ENDPOINT_MODE_NAME = 'ec2_metadata_service_endpoint_mode';
+
+var getEndpointModeConfigOptions = function() {
+  return {
+    environmentVariableSelector: function(env) { return env[ENV_ENDPOINT_MODE_NAME]; },
+    configFileSelector: function(profile) { return profile[CONFIG_ENDPOINT_MODE_NAME]; },
+    default: EndpointMode.IPv4,
+  };
+};
+
+module.exports = getEndpointModeConfigOptions;
+
+
+/***/ }),
 /* 274 */,
 /* 275 */,
 /* 276 */,
@@ -5736,7 +7428,7 @@ module.exports = Paginator;
 /* 280 */
 /***/ (function(module) {
 
-module.exports = {"pagination":{}};
+module.exports = {"pagination":{"ListIdentityPools":{"input_token":"NextToken","limit_key":"MaxResults","output_token":"NextToken","result_key":"IdentityPools"}}};
 
 /***/ }),
 /* 281 */,
@@ -5851,9 +7543,46 @@ exports.default = AsyncReader;
 /***/ }),
 /* 292 */,
 /* 293 */
-/***/ (function(module) {
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
-module.exports = require("buffer");
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _rng = _interopRequireDefault(__webpack_require__(506));
+
+var _stringify = _interopRequireDefault(__webpack_require__(960));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function v4(options, buf, offset) {
+  options = options || {};
+
+  const rnds = options.random || (options.rng || _rng.default)(); // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
+
+
+  rnds[6] = rnds[6] & 0x0f | 0x40;
+  rnds[8] = rnds[8] & 0x3f | 0x80; // Copy bytes to buffer, if provided
+
+  if (buf) {
+    offset = offset || 0;
+
+    for (let i = 0; i < 16; ++i) {
+      buf[offset + i] = rnds[i];
+    }
+
+    return buf;
+  }
+
+  return (0, _stringify.default)(rnds);
+}
+
+var _default = v4;
+exports.default = _default;
 
 /***/ }),
 /* 294 */,
@@ -5877,7 +7606,7 @@ module.exports = require("string_decoder");
 /***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
 
 var AWS = __webpack_require__(395);
-var STS = __webpack_require__(733);
+var STS = __webpack_require__(106);
 
 /**
  * Represents credentials retrieved from STS Web Identity Federation support.
@@ -6069,6 +7798,18 @@ var Json = __webpack_require__(912);
 var JsonBuilder = __webpack_require__(337);
 var JsonParser = __webpack_require__(806);
 
+var METHODS_WITHOUT_BODY = ['GET', 'HEAD', 'DELETE'];
+
+function unsetContentLength(req) {
+  var payloadMember = util.getRequestPayloadShape(req);
+  if (
+    payloadMember === undefined &&
+    METHODS_WITHOUT_BODY.indexOf(req.httpRequest.method) >= 0
+  ) {
+    delete req.httpRequest.headers['Content-Length'];
+  }
+}
+
 function populateBody(req) {
   var builder = new JsonBuilder();
   var input = req.service.api.operations[req.operation].input;
@@ -6077,30 +7818,24 @@ function populateBody(req) {
     var params = {};
     var payloadShape = input.members[input.payload];
     params = req.params[input.payload];
-    if (params === undefined) return;
 
     if (payloadShape.type === 'structure') {
-      req.httpRequest.body = builder.build(params, payloadShape);
+      req.httpRequest.body = builder.build(params || {}, payloadShape);
       applyContentTypeHeader(req);
-    } else { // non-JSON payload
+    } else if (params !== undefined) {
+      // non-JSON payload
       req.httpRequest.body = params;
       if (payloadShape.type === 'binary' || payloadShape.isStreaming) {
         applyContentTypeHeader(req, true);
       }
     }
   } else {
-    var body = builder.build(req.params, input);
-    if (body !== '{}' || req.httpRequest.method !== 'GET') { //don't send empty body for GET method
-      req.httpRequest.body = body;
-    }
+    req.httpRequest.body = builder.build(req.params, input);
     applyContentTypeHeader(req);
   }
 }
 
 function applyContentTypeHeader(req, isBinary) {
-  var operation = req.service.api.operations[req.operation];
-  var input = operation.input;
-
   if (!req.httpRequest.headers['Content-Type']) {
     var type = isBinary ? 'binary/octet-stream' : 'application/json';
     req.httpRequest.headers['Content-Type'] = type;
@@ -6110,8 +7845,8 @@ function applyContentTypeHeader(req, isBinary) {
 function buildRequest(req) {
   Rest.buildRequest(req);
 
-  // never send body payload on HEAD/DELETE
-  if (['HEAD', 'DELETE'].indexOf(req.httpRequest.method) < 0) {
+  // never send body payload on GET/HEAD/DELETE
+  if (METHODS_WITHOUT_BODY.indexOf(req.httpRequest.method) < 0) {
     populateBody(req);
   }
 }
@@ -6160,7 +7895,8 @@ function extractData(resp) {
 module.exports = {
   buildRequest: buildRequest,
   extractError: extractError,
-  extractData: extractData
+  extractData: extractData,
+  unsetContentLength: unsetContentLength
 };
 
 
@@ -6349,48 +8085,38 @@ run();
 
 
 /***/ }),
-/* 326 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
+/* 326 */,
+/* 327 */,
+/* 328 */,
+/* 329 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
 "use strict";
 
 
-const utils = __webpack_require__(225);
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
 
-module.exports = (ast, options = {}) => {
-  let stringify = (node, parent = {}) => {
-    let invalidBlock = options.escapeInvalid && utils.isInvalidBrace(parent);
-    let invalidNode = node.invalid === true && options.escapeInvalid === true;
-    let output = '';
+var _crypto = _interopRequireDefault(__webpack_require__(417));
 
-    if (node.value) {
-      if ((invalidBlock || invalidNode) && utils.isOpenOrClose(node)) {
-        return '\\' + node.value;
-      }
-      return node.value;
-    }
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
 
-    if (node.value) {
-      return node.value;
-    }
+function sha1(bytes) {
+  if (Array.isArray(bytes)) {
+    bytes = Buffer.from(bytes);
+  } else if (typeof bytes === 'string') {
+    bytes = Buffer.from(bytes, 'utf8');
+  }
 
-    if (node.nodes) {
-      for (let child of node.nodes) {
-        output += stringify(child);
-      }
-    }
-    return output;
-  };
+  return _crypto.default.createHash('sha1').update(bytes).digest();
+}
 
-  return stringify(ast);
-};
-
-
+var _default = sha1;
+exports.default = _default;
 
 /***/ }),
-/* 327 */,
-/* 328 */,
-/* 329 */,
 /* 330 */,
 /* 331 */,
 /* 332 */
@@ -6480,6 +8206,9 @@ function translate(value, shape) {
 }
 
 function translateStructure(structure, shape) {
+  if (shape.isDocument) {
+    return structure;
+  }
   var struct = {};
   util.each(structure, function(name, value) {
     var memberShape = shape.members[name];
@@ -6522,7 +8251,295 @@ module.exports = JsonBuilder;
 
 
 /***/ }),
-/* 338 */,
+/* 338 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+var AWS = __webpack_require__(395);
+var regionUtil = __webpack_require__(546);
+
+var s3util = {
+  /**
+   * @api private
+   */
+  isArnInParam: function isArnInParam(req, paramName) {
+    var inputShape = (req.service.api.operations[req.operation] || {}).input || {};
+    var inputMembers = inputShape.members || {};
+    if (!req.params[paramName] || !inputMembers[paramName]) return false;
+    return AWS.util.ARN.validate(req.params[paramName]);
+  },
+
+  /**
+   * Validate service component from ARN supplied in Bucket parameter
+   */
+  validateArnService: function validateArnService(req) {
+    var parsedArn = req._parsedArn;
+
+    if (parsedArn.service !== 's3'
+      && parsedArn.service !== 's3-outposts'
+      && parsedArn.service !== 's3-object-lambda') {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidARN',
+        message: 'expect \'s3\' or \'s3-outposts\' or \'s3-object-lambda\' in ARN service component'
+      });
+    }
+  },
+
+  /**
+   * Validate account ID from ARN supplied in Bucket parameter is a valid account
+   */
+  validateArnAccount: function validateArnAccount(req) {
+    var parsedArn = req._parsedArn;
+
+    if (!/[0-9]{12}/.exec(parsedArn.accountId)) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidARN',
+        message: 'ARN accountID does not match regex "[0-9]{12}"'
+      });
+    }
+  },
+
+  /**
+   * Validate ARN supplied in Bucket parameter is a valid access point ARN
+   */
+  validateS3AccessPointArn: function validateS3AccessPointArn(req) {
+    var parsedArn = req._parsedArn;
+
+    //can be ':' or '/'
+    var delimiter = parsedArn.resource['accesspoint'.length];
+
+    if (parsedArn.resource.split(delimiter).length !== 2) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidARN',
+        message: 'Access Point ARN should have one resource accesspoint/{accesspointName}'
+      });
+    }
+
+    var accessPoint = parsedArn.resource.split(delimiter)[1];
+    var accessPointPrefix = accessPoint + '-' + parsedArn.accountId;
+    if (!s3util.dnsCompatibleBucketName(accessPointPrefix) || accessPointPrefix.match(/\./)) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidARN',
+        message: 'Access point resource in ARN is not DNS compatible. Got ' + accessPoint
+      });
+    }
+
+    //set parsed valid access point
+    req._parsedArn.accessPoint = accessPoint;
+  },
+
+  /**
+   * Validate Outposts ARN supplied in Bucket parameter is a valid outposts ARN
+   */
+  validateOutpostsArn: function validateOutpostsArn(req) {
+    var parsedArn = req._parsedArn;
+
+    if (
+      parsedArn.resource.indexOf('outpost:') !== 0 &&
+      parsedArn.resource.indexOf('outpost/') !== 0
+    ) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidARN',
+        message: 'ARN resource should begin with \'outpost/\''
+      });
+    }
+
+    //can be ':' or '/'
+    var delimiter = parsedArn.resource['outpost'.length];
+    var outpostId = parsedArn.resource.split(delimiter)[1];
+    var dnsHostRegex = new RegExp(/^([a-zA-Z0-9]|[a-zA-Z0-9][a-zA-Z0-9-]{0,61}[a-zA-Z0-9])$/);
+    if (!dnsHostRegex.test(outpostId)) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidARN',
+        message: 'Outpost resource in ARN is not DNS compatible. Got ' + outpostId
+      });
+    }
+    req._parsedArn.outpostId = outpostId;
+  },
+
+  /**
+   * Validate Outposts ARN supplied in Bucket parameter is a valid outposts ARN
+   */
+  validateOutpostsAccessPointArn: function validateOutpostsAccessPointArn(req) {
+    var parsedArn = req._parsedArn;
+
+    //can be ':' or '/'
+    var delimiter = parsedArn.resource['outpost'.length];
+
+    if (parsedArn.resource.split(delimiter).length !== 4) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidARN',
+        message: 'Outposts ARN should have two resources outpost/{outpostId}/accesspoint/{accesspointName}'
+      });
+    }
+
+    var accessPoint = parsedArn.resource.split(delimiter)[3];
+    var accessPointPrefix = accessPoint + '-' + parsedArn.accountId;
+    if (!s3util.dnsCompatibleBucketName(accessPointPrefix) || accessPointPrefix.match(/\./)) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidARN',
+        message: 'Access point resource in ARN is not DNS compatible. Got ' + accessPoint
+      });
+    }
+
+    //set parsed valid access point
+    req._parsedArn.accessPoint = accessPoint;
+  },
+
+  /**
+   * Validate region field in ARN supplied in Bucket parameter is a valid region
+   */
+  validateArnRegion: function validateArnRegion(req, options) {
+    if (options === undefined) {
+      options = {};
+    }
+
+    var useArnRegion = s3util.loadUseArnRegionConfig(req);
+    var regionFromArn = req._parsedArn.region;
+    var clientRegion = req.service.config.region;
+    var useFipsEndpoint = req.service.config.useFipsEndpoint;
+    var allowFipsEndpoint = options.allowFipsEndpoint || false;
+
+    if (!regionFromArn) {
+      var message = 'ARN region is empty';
+      if (req._parsedArn.service === 's3') {
+        message = message + '\nYou may want to use multi-regional ARN. The feature is not supported in current SDK. ' +
+        'You should consider switching to V3(https://github.com/aws/aws-sdk-js-v3).';
+      }
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidARN',
+        message: message
+      });
+    }
+
+    if (useFipsEndpoint && !allowFipsEndpoint) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidConfiguration',
+        message: 'ARN endpoint is not compatible with FIPS region'
+      });
+    }
+
+    if (regionFromArn.indexOf('fips') >= 0) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidConfiguration',
+        message: 'FIPS region not allowed in ARN'
+      });
+    }
+
+    if (!useArnRegion && regionFromArn !== clientRegion) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidConfiguration',
+        message: 'Configured region conflicts with access point region'
+      });
+    } else if (
+      useArnRegion &&
+      regionUtil.getEndpointSuffix(regionFromArn) !== regionUtil.getEndpointSuffix(clientRegion)
+    ) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidConfiguration',
+        message: 'Configured region and access point region not in same partition'
+      });
+    }
+
+    if (req.service.config.useAccelerateEndpoint) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidConfiguration',
+        message: 'useAccelerateEndpoint config is not supported with access point ARN'
+      });
+    }
+
+    if (req._parsedArn.service === 's3-outposts' && req.service.config.useDualstackEndpoint) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidConfiguration',
+        message: 'Dualstack is not supported with outposts access point ARN'
+      });
+    }
+  },
+
+  loadUseArnRegionConfig: function loadUseArnRegionConfig(req) {
+    var envName = 'AWS_S3_USE_ARN_REGION';
+    var configName = 's3_use_arn_region';
+    var useArnRegion = true;
+    var originalConfig = req.service._originalConfig || {};
+    if (req.service.config.s3UseArnRegion !== undefined) {
+      return req.service.config.s3UseArnRegion;
+    } else if (originalConfig.s3UseArnRegion !== undefined) {
+      useArnRegion = originalConfig.s3UseArnRegion === true;
+    } else if (AWS.util.isNode()) {
+      //load from environmental variable AWS_USE_ARN_REGION
+      if (process.env[envName]) {
+        var value = process.env[envName].trim().toLowerCase();
+        if (['false', 'true'].indexOf(value) < 0) {
+          throw AWS.util.error(new Error(), {
+            code: 'InvalidConfiguration',
+            message: envName + ' only accepts true or false. Got ' + process.env[envName],
+            retryable: false
+          });
+        }
+        useArnRegion = value === 'true';
+      } else {  //load from shared config property use_arn_region
+        var profiles = {};
+        var profile = {};
+        try {
+          profiles = AWS.util.getProfilesFromSharedConfig(AWS.util.iniLoader);
+          profile = profiles[process.env.AWS_PROFILE || AWS.util.defaultProfile];
+        } catch (e) {}
+        if (profile[configName]) {
+          if (['false', 'true'].indexOf(profile[configName].trim().toLowerCase()) < 0) {
+            throw AWS.util.error(new Error(), {
+              code: 'InvalidConfiguration',
+              message: configName + ' only accepts true or false. Got ' + profile[configName],
+              retryable: false
+            });
+          }
+          useArnRegion = profile[configName].trim().toLowerCase() === 'true';
+        }
+      }
+    }
+    req.service.config.s3UseArnRegion = useArnRegion;
+    return useArnRegion;
+  },
+
+  /**
+   * Validations before URI can be populated
+   */
+  validatePopulateUriFromArn: function validatePopulateUriFromArn(req) {
+    if (req.service._originalConfig && req.service._originalConfig.endpoint) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidConfiguration',
+        message: 'Custom endpoint is not compatible with access point ARN'
+      });
+    }
+
+    if (req.service.config.s3ForcePathStyle) {
+      throw AWS.util.error(new Error(), {
+        code: 'InvalidConfiguration',
+        message: 'Cannot construct path-style endpoint with access point'
+      });
+    }
+  },
+
+  /**
+   * Returns true if the bucket name is DNS compatible.  Buckets created
+   * outside of the classic region MUST be DNS compatible.
+   *
+   * @api private
+   */
+  dnsCompatibleBucketName: function dnsCompatibleBucketName(bucketName) {
+    var b = bucketName;
+    var domain = new RegExp(/^[a-z0-9][a-z0-9\.\-]{1,61}[a-z0-9]$/);
+    var ipAddress = new RegExp(/(\d+\.){3}\d+/);
+    var dots = new RegExp(/\.\./);
+    return (b.match(domain) && !b.match(ipAddress) && !b.match(dots)) ? true : false;
+  },
+};
+
+/**
+ * @api private
+ */
+module.exports = s3util;
+
+
+/***/ }),
 /* 339 */,
 /* 340 */,
 /* 341 */,
@@ -6581,57 +8598,9 @@ module.exports = JsonBuilder;
 /* 355 */,
 /* 356 */,
 /* 357 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
+/***/ (function(module) {
 
-/*!
- * is-glob <https://github.com/jonschlinkert/is-glob>
- *
- * Copyright (c) 2014-2017, Jon Schlinkert.
- * Released under the MIT License.
- */
-
-var isExtglob = __webpack_require__(999);
-var chars = { '{': '}', '(': ')', '[': ']'};
-var strictRegex = /\\(.)|(^!|\*|[\].+)]\?|\[[^\\\]]+\]|\{[^\\}]+\}|\(\?[:!=][^\\)]+\)|\([^|]+\|[^\\)]+\))/;
-var relaxedRegex = /\\(.)|(^!|[*?{}()[\]]|\(\?)/;
-
-module.exports = function isGlob(str, options) {
-  if (typeof str !== 'string' || str === '') {
-    return false;
-  }
-
-  if (isExtglob(str)) {
-    return true;
-  }
-
-  var regex = strictRegex;
-  var match;
-
-  // optionally relax regex
-  if (options && options.strict === false) {
-    regex = relaxedRegex;
-  }
-
-  while ((match = regex.exec(str))) {
-    if (match[2]) return true;
-    var idx = match.index + match[0].length;
-
-    // if an open bracket/brace/paren is escaped,
-    // set the index to the next closing character
-    var open = match[1];
-    var close = open ? chars[open] : null;
-    if (open && close) {
-      var n = str.indexOf(close, idx);
-      if (n !== -1) {
-        idx = n + 1;
-      }
-    }
-
-    str = str.slice(idx);
-  }
-  return false;
-};
-
+module.exports = require("assert");
 
 /***/ }),
 /* 358 */,
@@ -7025,23 +8994,41 @@ exports.default = ErrorFilter;
 /* 380 */,
 /* 381 */,
 /* 382 */
-/***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
+/***/ (function(module, __unusedexports, __webpack_require__) {
 
-var AWS = __webpack_require__(395);
+"use strict";
 
-AWS.util.update(AWS.CognitoIdentity.prototype, {
-  getOpenIdToken: function getOpenIdToken(params, callback) {
-    return this.makeUnauthenticatedRequest('getOpenIdToken', params, callback);
-  },
 
-  getId: function getId(params, callback) {
-    return this.makeUnauthenticatedRequest('getId', params, callback);
-  },
+const utils = __webpack_require__(225);
 
-  getCredentialsForIdentity: function getCredentialsForIdentity(params, callback) {
-    return this.makeUnauthenticatedRequest('getCredentialsForIdentity', params, callback);
-  }
-});
+module.exports = (ast, options = {}) => {
+  let stringify = (node, parent = {}) => {
+    let invalidBlock = options.escapeInvalid && utils.isInvalidBrace(parent);
+    let invalidNode = node.invalid === true && options.escapeInvalid === true;
+    let output = '';
+
+    if (node.value) {
+      if ((invalidBlock || invalidNode) && utils.isOpenOrClose(node)) {
+        return '\\' + node.value;
+      }
+      return node.value;
+    }
+
+    if (node.value) {
+      return node.value;
+    }
+
+    if (node.nodes) {
+      for (let child of node.nodes) {
+        output += stringify(child);
+      }
+    }
+    return output;
+  };
+
+  return stringify(ast);
+};
+
 
 
 /***/ }),
@@ -7051,71 +9038,21 @@ AWS.util.update(AWS.CognitoIdentity.prototype, {
 
 "use strict";
 
-Object.defineProperty(exports, "__esModule", { value: true });
-exports.convertPatternGroupToTask = exports.convertPatternGroupsToTasks = exports.groupPatternsByBaseDirectory = exports.getNegativePatternsAsPositive = exports.getPositivePatterns = exports.convertPatternsToTasks = exports.generate = void 0;
-const utils = __webpack_require__(501);
-function generate(patterns, settings) {
-    const positivePatterns = getPositivePatterns(patterns);
-    const negativePatterns = getNegativePatternsAsPositive(patterns, settings.ignore);
-    const staticPatterns = positivePatterns.filter((pattern) => utils.pattern.isStaticPattern(pattern, settings));
-    const dynamicPatterns = positivePatterns.filter((pattern) => utils.pattern.isDynamicPattern(pattern, settings));
-    const staticTasks = convertPatternsToTasks(staticPatterns, negativePatterns, /* dynamic */ false);
-    const dynamicTasks = convertPatternsToTasks(dynamicPatterns, negativePatterns, /* dynamic */ true);
-    return staticTasks.concat(dynamicTasks);
-}
-exports.generate = generate;
-function convertPatternsToTasks(positive, negative, dynamic) {
-    const positivePatternsGroup = groupPatternsByBaseDirectory(positive);
-    // When we have a global group – there is no reason to divide the patterns into independent tasks.
-    // In this case, the global task covers the rest.
-    if ('.' in positivePatternsGroup) {
-        const task = convertPatternGroupToTask('.', positive, negative, dynamic);
-        return [task];
-    }
-    return convertPatternGroupsToTasks(positivePatternsGroup, negative, dynamic);
-}
-exports.convertPatternsToTasks = convertPatternsToTasks;
-function getPositivePatterns(patterns) {
-    return utils.pattern.getPositivePatterns(patterns);
-}
-exports.getPositivePatterns = getPositivePatterns;
-function getNegativePatternsAsPositive(patterns, ignore) {
-    const negative = utils.pattern.getNegativePatterns(patterns).concat(ignore);
-    const positive = negative.map(utils.pattern.convertToPositivePattern);
-    return positive;
-}
-exports.getNegativePatternsAsPositive = getNegativePatternsAsPositive;
-function groupPatternsByBaseDirectory(patterns) {
-    const group = {};
-    return patterns.reduce((collection, pattern) => {
-        const base = utils.pattern.getBaseDirectory(pattern);
-        if (base in collection) {
-            collection[base].push(pattern);
-        }
-        else {
-            collection[base] = [pattern];
-        }
-        return collection;
-    }, group);
-}
-exports.groupPatternsByBaseDirectory = groupPatternsByBaseDirectory;
-function convertPatternGroupsToTasks(positive, negative, dynamic) {
-    return Object.keys(positive).map((base) => {
-        return convertPatternGroupToTask(base, positive[base], negative, dynamic);
-    });
-}
-exports.convertPatternGroupsToTasks = convertPatternGroupsToTasks;
-function convertPatternGroupToTask(base, positive, negative, dynamic) {
-    return {
-        dynamic,
-        positive,
-        negative,
-        base,
-        patterns: [].concat(positive, negative.map(utils.pattern.convertToNegativePattern))
-    };
-}
-exports.convertPatternGroupToTask = convertPatternGroupToTask;
 
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _v = _interopRequireDefault(__webpack_require__(212));
+
+var _sha = _interopRequireDefault(__webpack_require__(498));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+const v5 = (0, _v.default)('v5', 0x50, _sha.default);
+var _default = v5;
+exports.default = _default;
 
 /***/ }),
 /* 385 */,
@@ -7159,7 +9096,38 @@ function callSuccessCallback(callback, entries) {
 /***/ }),
 /* 388 */,
 /* 389 */,
-/* 390 */,
+/* 390 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+/**
+ * Convert array of 16 byte values to UUID string format of the form:
+ * XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+ */
+var byteToHex = [];
+
+for (var i = 0; i < 256; ++i) {
+  byteToHex[i] = (i + 0x100).toString(16).substr(1);
+}
+
+function bytesToUuid(buf, offset) {
+  var i = offset || 0;
+  var bth = byteToHex; // join used to fix memory issue caused by concatenation: https://bugs.chromium.org/p/v8/issues/detail?id=3175#c4
+
+  return [bth[buf[i++]], bth[buf[i++]], bth[buf[i++]], bth[buf[i++]], '-', bth[buf[i++]], bth[buf[i++]], '-', bth[buf[i++]], bth[buf[i++]], '-', bth[buf[i++]], bth[buf[i++]], '-', bth[buf[i++]], bth[buf[i++]], bth[buf[i++]], bth[buf[i++]], bth[buf[i++]], bth[buf[i++]]].join('');
+}
+
+var _default = bytesToUuid;
+exports.default = _default;
+
+/***/ }),
 /* 391 */,
 /* 392 */,
 /* 393 */,
@@ -7206,7 +9174,7 @@ AWS.util.update(AWS, {
   /**
    * @constant
    */
-  VERSION: '2.725.0',
+  VERSION: '2.1266.0',
 
   /**
    * @api private
@@ -7310,7 +9278,7 @@ AWS.util.memoizedProperty(AWS, 'endpointCache', function() {
 
 Object.defineProperty(exports, "__esModule", { value: true });
 const path = __webpack_require__(622);
-const fsStat = __webpack_require__(858);
+const fsStat = __webpack_require__(109);
 const fs = __webpack_require__(874);
 class Settings {
     constructor(_options = {}) {
@@ -7391,7 +9359,7 @@ module.exports = {
 
 "use strict";
 
-const taskManager = __webpack_require__(384);
+const taskManager = __webpack_require__(882);
 const async_1 = __webpack_require__(113);
 const stream_1 = __webpack_require__(775);
 const sync_1 = __webpack_require__(78);
@@ -7460,16 +9428,22 @@ module.exports = FastGlob;
 
 
 /***/ }),
-/* 407 */,
+/* 407 */
+/***/ (function(module) {
+
+module.exports = require("buffer");
+
+/***/ }),
 /* 408 */,
 /* 409 */,
 /* 410 */,
 /* 411 */,
 /* 412 */,
 /* 413 */
-/***/ (function(module) {
+/***/ (function(module, __unusedexports, __webpack_require__) {
 
-module.exports = require("stream");
+module.exports = __webpack_require__(141);
+
 
 /***/ }),
 /* 414 */
@@ -7651,7 +9625,617 @@ exports.createDirentFromStats = createDirentFromStats;
 
 
 /***/ }),
-/* 425 */,
+/* 425 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+/* eslint-disable @typescript-eslint/no-explicit-any */
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.HttpClient = exports.isHttps = exports.HttpClientResponse = exports.HttpClientError = exports.getProxyUrl = exports.MediaTypes = exports.Headers = exports.HttpCodes = void 0;
+const http = __importStar(__webpack_require__(605));
+const https = __importStar(__webpack_require__(211));
+const pm = __importStar(__webpack_require__(177));
+const tunnel = __importStar(__webpack_require__(413));
+var HttpCodes;
+(function (HttpCodes) {
+    HttpCodes[HttpCodes["OK"] = 200] = "OK";
+    HttpCodes[HttpCodes["MultipleChoices"] = 300] = "MultipleChoices";
+    HttpCodes[HttpCodes["MovedPermanently"] = 301] = "MovedPermanently";
+    HttpCodes[HttpCodes["ResourceMoved"] = 302] = "ResourceMoved";
+    HttpCodes[HttpCodes["SeeOther"] = 303] = "SeeOther";
+    HttpCodes[HttpCodes["NotModified"] = 304] = "NotModified";
+    HttpCodes[HttpCodes["UseProxy"] = 305] = "UseProxy";
+    HttpCodes[HttpCodes["SwitchProxy"] = 306] = "SwitchProxy";
+    HttpCodes[HttpCodes["TemporaryRedirect"] = 307] = "TemporaryRedirect";
+    HttpCodes[HttpCodes["PermanentRedirect"] = 308] = "PermanentRedirect";
+    HttpCodes[HttpCodes["BadRequest"] = 400] = "BadRequest";
+    HttpCodes[HttpCodes["Unauthorized"] = 401] = "Unauthorized";
+    HttpCodes[HttpCodes["PaymentRequired"] = 402] = "PaymentRequired";
+    HttpCodes[HttpCodes["Forbidden"] = 403] = "Forbidden";
+    HttpCodes[HttpCodes["NotFound"] = 404] = "NotFound";
+    HttpCodes[HttpCodes["MethodNotAllowed"] = 405] = "MethodNotAllowed";
+    HttpCodes[HttpCodes["NotAcceptable"] = 406] = "NotAcceptable";
+    HttpCodes[HttpCodes["ProxyAuthenticationRequired"] = 407] = "ProxyAuthenticationRequired";
+    HttpCodes[HttpCodes["RequestTimeout"] = 408] = "RequestTimeout";
+    HttpCodes[HttpCodes["Conflict"] = 409] = "Conflict";
+    HttpCodes[HttpCodes["Gone"] = 410] = "Gone";
+    HttpCodes[HttpCodes["TooManyRequests"] = 429] = "TooManyRequests";
+    HttpCodes[HttpCodes["InternalServerError"] = 500] = "InternalServerError";
+    HttpCodes[HttpCodes["NotImplemented"] = 501] = "NotImplemented";
+    HttpCodes[HttpCodes["BadGateway"] = 502] = "BadGateway";
+    HttpCodes[HttpCodes["ServiceUnavailable"] = 503] = "ServiceUnavailable";
+    HttpCodes[HttpCodes["GatewayTimeout"] = 504] = "GatewayTimeout";
+})(HttpCodes = exports.HttpCodes || (exports.HttpCodes = {}));
+var Headers;
+(function (Headers) {
+    Headers["Accept"] = "accept";
+    Headers["ContentType"] = "content-type";
+})(Headers = exports.Headers || (exports.Headers = {}));
+var MediaTypes;
+(function (MediaTypes) {
+    MediaTypes["ApplicationJson"] = "application/json";
+})(MediaTypes = exports.MediaTypes || (exports.MediaTypes = {}));
+/**
+ * Returns the proxy URL, depending upon the supplied url and proxy environment variables.
+ * @param serverUrl  The server URL where the request will be sent. For example, https://api.github.com
+ */
+function getProxyUrl(serverUrl) {
+    const proxyUrl = pm.getProxyUrl(new URL(serverUrl));
+    return proxyUrl ? proxyUrl.href : '';
+}
+exports.getProxyUrl = getProxyUrl;
+const HttpRedirectCodes = [
+    HttpCodes.MovedPermanently,
+    HttpCodes.ResourceMoved,
+    HttpCodes.SeeOther,
+    HttpCodes.TemporaryRedirect,
+    HttpCodes.PermanentRedirect
+];
+const HttpResponseRetryCodes = [
+    HttpCodes.BadGateway,
+    HttpCodes.ServiceUnavailable,
+    HttpCodes.GatewayTimeout
+];
+const RetryableHttpVerbs = ['OPTIONS', 'GET', 'DELETE', 'HEAD'];
+const ExponentialBackoffCeiling = 10;
+const ExponentialBackoffTimeSlice = 5;
+class HttpClientError extends Error {
+    constructor(message, statusCode) {
+        super(message);
+        this.name = 'HttpClientError';
+        this.statusCode = statusCode;
+        Object.setPrototypeOf(this, HttpClientError.prototype);
+    }
+}
+exports.HttpClientError = HttpClientError;
+class HttpClientResponse {
+    constructor(message) {
+        this.message = message;
+    }
+    readBody() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return new Promise((resolve) => __awaiter(this, void 0, void 0, function* () {
+                let output = Buffer.alloc(0);
+                this.message.on('data', (chunk) => {
+                    output = Buffer.concat([output, chunk]);
+                });
+                this.message.on('end', () => {
+                    resolve(output.toString());
+                });
+            }));
+        });
+    }
+}
+exports.HttpClientResponse = HttpClientResponse;
+function isHttps(requestUrl) {
+    const parsedUrl = new URL(requestUrl);
+    return parsedUrl.protocol === 'https:';
+}
+exports.isHttps = isHttps;
+class HttpClient {
+    constructor(userAgent, handlers, requestOptions) {
+        this._ignoreSslError = false;
+        this._allowRedirects = true;
+        this._allowRedirectDowngrade = false;
+        this._maxRedirects = 50;
+        this._allowRetries = false;
+        this._maxRetries = 1;
+        this._keepAlive = false;
+        this._disposed = false;
+        this.userAgent = userAgent;
+        this.handlers = handlers || [];
+        this.requestOptions = requestOptions;
+        if (requestOptions) {
+            if (requestOptions.ignoreSslError != null) {
+                this._ignoreSslError = requestOptions.ignoreSslError;
+            }
+            this._socketTimeout = requestOptions.socketTimeout;
+            if (requestOptions.allowRedirects != null) {
+                this._allowRedirects = requestOptions.allowRedirects;
+            }
+            if (requestOptions.allowRedirectDowngrade != null) {
+                this._allowRedirectDowngrade = requestOptions.allowRedirectDowngrade;
+            }
+            if (requestOptions.maxRedirects != null) {
+                this._maxRedirects = Math.max(requestOptions.maxRedirects, 0);
+            }
+            if (requestOptions.keepAlive != null) {
+                this._keepAlive = requestOptions.keepAlive;
+            }
+            if (requestOptions.allowRetries != null) {
+                this._allowRetries = requestOptions.allowRetries;
+            }
+            if (requestOptions.maxRetries != null) {
+                this._maxRetries = requestOptions.maxRetries;
+            }
+        }
+    }
+    options(requestUrl, additionalHeaders) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.request('OPTIONS', requestUrl, null, additionalHeaders || {});
+        });
+    }
+    get(requestUrl, additionalHeaders) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.request('GET', requestUrl, null, additionalHeaders || {});
+        });
+    }
+    del(requestUrl, additionalHeaders) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.request('DELETE', requestUrl, null, additionalHeaders || {});
+        });
+    }
+    post(requestUrl, data, additionalHeaders) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.request('POST', requestUrl, data, additionalHeaders || {});
+        });
+    }
+    patch(requestUrl, data, additionalHeaders) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.request('PATCH', requestUrl, data, additionalHeaders || {});
+        });
+    }
+    put(requestUrl, data, additionalHeaders) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.request('PUT', requestUrl, data, additionalHeaders || {});
+        });
+    }
+    head(requestUrl, additionalHeaders) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.request('HEAD', requestUrl, null, additionalHeaders || {});
+        });
+    }
+    sendStream(verb, requestUrl, stream, additionalHeaders) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.request(verb, requestUrl, stream, additionalHeaders);
+        });
+    }
+    /**
+     * Gets a typed object from an endpoint
+     * Be aware that not found returns a null.  Other errors (4xx, 5xx) reject the promise
+     */
+    getJson(requestUrl, additionalHeaders = {}) {
+        return __awaiter(this, void 0, void 0, function* () {
+            additionalHeaders[Headers.Accept] = this._getExistingOrDefaultHeader(additionalHeaders, Headers.Accept, MediaTypes.ApplicationJson);
+            const res = yield this.get(requestUrl, additionalHeaders);
+            return this._processResponse(res, this.requestOptions);
+        });
+    }
+    postJson(requestUrl, obj, additionalHeaders = {}) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const data = JSON.stringify(obj, null, 2);
+            additionalHeaders[Headers.Accept] = this._getExistingOrDefaultHeader(additionalHeaders, Headers.Accept, MediaTypes.ApplicationJson);
+            additionalHeaders[Headers.ContentType] = this._getExistingOrDefaultHeader(additionalHeaders, Headers.ContentType, MediaTypes.ApplicationJson);
+            const res = yield this.post(requestUrl, data, additionalHeaders);
+            return this._processResponse(res, this.requestOptions);
+        });
+    }
+    putJson(requestUrl, obj, additionalHeaders = {}) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const data = JSON.stringify(obj, null, 2);
+            additionalHeaders[Headers.Accept] = this._getExistingOrDefaultHeader(additionalHeaders, Headers.Accept, MediaTypes.ApplicationJson);
+            additionalHeaders[Headers.ContentType] = this._getExistingOrDefaultHeader(additionalHeaders, Headers.ContentType, MediaTypes.ApplicationJson);
+            const res = yield this.put(requestUrl, data, additionalHeaders);
+            return this._processResponse(res, this.requestOptions);
+        });
+    }
+    patchJson(requestUrl, obj, additionalHeaders = {}) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const data = JSON.stringify(obj, null, 2);
+            additionalHeaders[Headers.Accept] = this._getExistingOrDefaultHeader(additionalHeaders, Headers.Accept, MediaTypes.ApplicationJson);
+            additionalHeaders[Headers.ContentType] = this._getExistingOrDefaultHeader(additionalHeaders, Headers.ContentType, MediaTypes.ApplicationJson);
+            const res = yield this.patch(requestUrl, data, additionalHeaders);
+            return this._processResponse(res, this.requestOptions);
+        });
+    }
+    /**
+     * Makes a raw http request.
+     * All other methods such as get, post, patch, and request ultimately call this.
+     * Prefer get, del, post and patch
+     */
+    request(verb, requestUrl, data, headers) {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (this._disposed) {
+                throw new Error('Client has already been disposed.');
+            }
+            const parsedUrl = new URL(requestUrl);
+            let info = this._prepareRequest(verb, parsedUrl, headers);
+            // Only perform retries on reads since writes may not be idempotent.
+            const maxTries = this._allowRetries && RetryableHttpVerbs.includes(verb)
+                ? this._maxRetries + 1
+                : 1;
+            let numTries = 0;
+            let response;
+            do {
+                response = yield this.requestRaw(info, data);
+                // Check if it's an authentication challenge
+                if (response &&
+                    response.message &&
+                    response.message.statusCode === HttpCodes.Unauthorized) {
+                    let authenticationHandler;
+                    for (const handler of this.handlers) {
+                        if (handler.canHandleAuthentication(response)) {
+                            authenticationHandler = handler;
+                            break;
+                        }
+                    }
+                    if (authenticationHandler) {
+                        return authenticationHandler.handleAuthentication(this, info, data);
+                    }
+                    else {
+                        // We have received an unauthorized response but have no handlers to handle it.
+                        // Let the response return to the caller.
+                        return response;
+                    }
+                }
+                let redirectsRemaining = this._maxRedirects;
+                while (response.message.statusCode &&
+                    HttpRedirectCodes.includes(response.message.statusCode) &&
+                    this._allowRedirects &&
+                    redirectsRemaining > 0) {
+                    const redirectUrl = response.message.headers['location'];
+                    if (!redirectUrl) {
+                        // if there's no location to redirect to, we won't
+                        break;
+                    }
+                    const parsedRedirectUrl = new URL(redirectUrl);
+                    if (parsedUrl.protocol === 'https:' &&
+                        parsedUrl.protocol !== parsedRedirectUrl.protocol &&
+                        !this._allowRedirectDowngrade) {
+                        throw new Error('Redirect from HTTPS to HTTP protocol. This downgrade is not allowed for security reasons. If you want to allow this behavior, set the allowRedirectDowngrade option to true.');
+                    }
+                    // we need to finish reading the response before reassigning response
+                    // which will leak the open socket.
+                    yield response.readBody();
+                    // strip authorization header if redirected to a different hostname
+                    if (parsedRedirectUrl.hostname !== parsedUrl.hostname) {
+                        for (const header in headers) {
+                            // header names are case insensitive
+                            if (header.toLowerCase() === 'authorization') {
+                                delete headers[header];
+                            }
+                        }
+                    }
+                    // let's make the request with the new redirectUrl
+                    info = this._prepareRequest(verb, parsedRedirectUrl, headers);
+                    response = yield this.requestRaw(info, data);
+                    redirectsRemaining--;
+                }
+                if (!response.message.statusCode ||
+                    !HttpResponseRetryCodes.includes(response.message.statusCode)) {
+                    // If not a retry code, return immediately instead of retrying
+                    return response;
+                }
+                numTries += 1;
+                if (numTries < maxTries) {
+                    yield response.readBody();
+                    yield this._performExponentialBackoff(numTries);
+                }
+            } while (numTries < maxTries);
+            return response;
+        });
+    }
+    /**
+     * Needs to be called if keepAlive is set to true in request options.
+     */
+    dispose() {
+        if (this._agent) {
+            this._agent.destroy();
+        }
+        this._disposed = true;
+    }
+    /**
+     * Raw request.
+     * @param info
+     * @param data
+     */
+    requestRaw(info, data) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return new Promise((resolve, reject) => {
+                function callbackForResult(err, res) {
+                    if (err) {
+                        reject(err);
+                    }
+                    else if (!res) {
+                        // If `err` is not passed, then `res` must be passed.
+                        reject(new Error('Unknown error'));
+                    }
+                    else {
+                        resolve(res);
+                    }
+                }
+                this.requestRawWithCallback(info, data, callbackForResult);
+            });
+        });
+    }
+    /**
+     * Raw request with callback.
+     * @param info
+     * @param data
+     * @param onResult
+     */
+    requestRawWithCallback(info, data, onResult) {
+        if (typeof data === 'string') {
+            if (!info.options.headers) {
+                info.options.headers = {};
+            }
+            info.options.headers['Content-Length'] = Buffer.byteLength(data, 'utf8');
+        }
+        let callbackCalled = false;
+        function handleResult(err, res) {
+            if (!callbackCalled) {
+                callbackCalled = true;
+                onResult(err, res);
+            }
+        }
+        const req = info.httpModule.request(info.options, (msg) => {
+            const res = new HttpClientResponse(msg);
+            handleResult(undefined, res);
+        });
+        let socket;
+        req.on('socket', sock => {
+            socket = sock;
+        });
+        // If we ever get disconnected, we want the socket to timeout eventually
+        req.setTimeout(this._socketTimeout || 3 * 60000, () => {
+            if (socket) {
+                socket.end();
+            }
+            handleResult(new Error(`Request timeout: ${info.options.path}`));
+        });
+        req.on('error', function (err) {
+            // err has statusCode property
+            // res should have headers
+            handleResult(err);
+        });
+        if (data && typeof data === 'string') {
+            req.write(data, 'utf8');
+        }
+        if (data && typeof data !== 'string') {
+            data.on('close', function () {
+                req.end();
+            });
+            data.pipe(req);
+        }
+        else {
+            req.end();
+        }
+    }
+    /**
+     * Gets an http agent. This function is useful when you need an http agent that handles
+     * routing through a proxy server - depending upon the url and proxy environment variables.
+     * @param serverUrl  The server URL where the request will be sent. For example, https://api.github.com
+     */
+    getAgent(serverUrl) {
+        const parsedUrl = new URL(serverUrl);
+        return this._getAgent(parsedUrl);
+    }
+    _prepareRequest(method, requestUrl, headers) {
+        const info = {};
+        info.parsedUrl = requestUrl;
+        const usingSsl = info.parsedUrl.protocol === 'https:';
+        info.httpModule = usingSsl ? https : http;
+        const defaultPort = usingSsl ? 443 : 80;
+        info.options = {};
+        info.options.host = info.parsedUrl.hostname;
+        info.options.port = info.parsedUrl.port
+            ? parseInt(info.parsedUrl.port)
+            : defaultPort;
+        info.options.path =
+            (info.parsedUrl.pathname || '') + (info.parsedUrl.search || '');
+        info.options.method = method;
+        info.options.headers = this._mergeHeaders(headers);
+        if (this.userAgent != null) {
+            info.options.headers['user-agent'] = this.userAgent;
+        }
+        info.options.agent = this._getAgent(info.parsedUrl);
+        // gives handlers an opportunity to participate
+        if (this.handlers) {
+            for (const handler of this.handlers) {
+                handler.prepareRequest(info.options);
+            }
+        }
+        return info;
+    }
+    _mergeHeaders(headers) {
+        if (this.requestOptions && this.requestOptions.headers) {
+            return Object.assign({}, lowercaseKeys(this.requestOptions.headers), lowercaseKeys(headers || {}));
+        }
+        return lowercaseKeys(headers || {});
+    }
+    _getExistingOrDefaultHeader(additionalHeaders, header, _default) {
+        let clientHeader;
+        if (this.requestOptions && this.requestOptions.headers) {
+            clientHeader = lowercaseKeys(this.requestOptions.headers)[header];
+        }
+        return additionalHeaders[header] || clientHeader || _default;
+    }
+    _getAgent(parsedUrl) {
+        let agent;
+        const proxyUrl = pm.getProxyUrl(parsedUrl);
+        const useProxy = proxyUrl && proxyUrl.hostname;
+        if (this._keepAlive && useProxy) {
+            agent = this._proxyAgent;
+        }
+        if (this._keepAlive && !useProxy) {
+            agent = this._agent;
+        }
+        // if agent is already assigned use that agent.
+        if (agent) {
+            return agent;
+        }
+        const usingSsl = parsedUrl.protocol === 'https:';
+        let maxSockets = 100;
+        if (this.requestOptions) {
+            maxSockets = this.requestOptions.maxSockets || http.globalAgent.maxSockets;
+        }
+        // This is `useProxy` again, but we need to check `proxyURl` directly for TypeScripts's flow analysis.
+        if (proxyUrl && proxyUrl.hostname) {
+            const agentOptions = {
+                maxSockets,
+                keepAlive: this._keepAlive,
+                proxy: Object.assign(Object.assign({}, ((proxyUrl.username || proxyUrl.password) && {
+                    proxyAuth: `${proxyUrl.username}:${proxyUrl.password}`
+                })), { host: proxyUrl.hostname, port: proxyUrl.port })
+            };
+            let tunnelAgent;
+            const overHttps = proxyUrl.protocol === 'https:';
+            if (usingSsl) {
+                tunnelAgent = overHttps ? tunnel.httpsOverHttps : tunnel.httpsOverHttp;
+            }
+            else {
+                tunnelAgent = overHttps ? tunnel.httpOverHttps : tunnel.httpOverHttp;
+            }
+            agent = tunnelAgent(agentOptions);
+            this._proxyAgent = agent;
+        }
+        // if reusing agent across request and tunneling agent isn't assigned create a new agent
+        if (this._keepAlive && !agent) {
+            const options = { keepAlive: this._keepAlive, maxSockets };
+            agent = usingSsl ? new https.Agent(options) : new http.Agent(options);
+            this._agent = agent;
+        }
+        // if not using private agent and tunnel agent isn't setup then use global agent
+        if (!agent) {
+            agent = usingSsl ? https.globalAgent : http.globalAgent;
+        }
+        if (usingSsl && this._ignoreSslError) {
+            // we don't want to set NODE_TLS_REJECT_UNAUTHORIZED=0 since that will affect request for entire process
+            // http.RequestOptions doesn't expose a way to modify RequestOptions.agent.options
+            // we have to cast it to any and change it directly
+            agent.options = Object.assign(agent.options || {}, {
+                rejectUnauthorized: false
+            });
+        }
+        return agent;
+    }
+    _performExponentialBackoff(retryNumber) {
+        return __awaiter(this, void 0, void 0, function* () {
+            retryNumber = Math.min(ExponentialBackoffCeiling, retryNumber);
+            const ms = ExponentialBackoffTimeSlice * Math.pow(2, retryNumber);
+            return new Promise(resolve => setTimeout(() => resolve(), ms));
+        });
+    }
+    _processResponse(res, options) {
+        return __awaiter(this, void 0, void 0, function* () {
+            return new Promise((resolve, reject) => __awaiter(this, void 0, void 0, function* () {
+                const statusCode = res.message.statusCode || 0;
+                const response = {
+                    statusCode,
+                    result: null,
+                    headers: {}
+                };
+                // not found leads to null obj returned
+                if (statusCode === HttpCodes.NotFound) {
+                    resolve(response);
+                }
+                // get the result from the body
+                function dateTimeDeserializer(key, value) {
+                    if (typeof value === 'string') {
+                        const a = new Date(value);
+                        if (!isNaN(a.valueOf())) {
+                            return a;
+                        }
+                    }
+                    return value;
+                }
+                let obj;
+                let contents;
+                try {
+                    contents = yield res.readBody();
+                    if (contents && contents.length > 0) {
+                        if (options && options.deserializeDates) {
+                            obj = JSON.parse(contents, dateTimeDeserializer);
+                        }
+                        else {
+                            obj = JSON.parse(contents);
+                        }
+                        response.result = obj;
+                    }
+                    response.headers = res.message.headers;
+                }
+                catch (err) {
+                    // Invalid resource (contents not json);  leaving result obj null
+                }
+                // note that 3xx redirects are handled by the http layer.
+                if (statusCode > 299) {
+                    let msg;
+                    // if exception/error in body, attempt to get better error
+                    if (obj && obj.message) {
+                        msg = obj.message;
+                    }
+                    else if (contents && contents.length > 0) {
+                        // it may be the case that the exception is in the body message as string
+                        msg = contents;
+                    }
+                    else {
+                        msg = `Failed request: (${statusCode})`;
+                    }
+                    const err = new HttpClientError(msg, statusCode);
+                    err.result = response.result;
+                    reject(err);
+                }
+                else {
+                    resolve(response);
+                }
+            }));
+        });
+    }
+}
+exports.HttpClient = HttpClient;
+const lowercaseKeys = (obj) => Object.keys(obj).reduce((c, k) => ((c[k.toLowerCase()] = obj[k]), c), {});
+//# sourceMappingURL=index.js.map
+
+/***/ }),
 /* 426 */
 /***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
 
@@ -7875,15 +10459,29 @@ AWS.RemoteCredentials = AWS.util.inherit(AWS.Credentials, {
 
 "use strict";
 
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
 var __importStar = (this && this.__importStar) || function (mod) {
     if (mod && mod.__esModule) return mod;
     var result = {};
-    if (mod != null) for (var k in mod) if (Object.hasOwnProperty.call(mod, k)) result[k] = mod[k];
-    result["default"] = mod;
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
     return result;
 };
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.issue = exports.issueCommand = void 0;
 const os = __importStar(__webpack_require__(87));
+const utils_1 = __webpack_require__(82);
 /**
  * Commands
  *
@@ -7937,28 +10535,14 @@ class Command {
         return cmdStr;
     }
 }
-/**
- * Sanitizes an input into a string so it can be passed into issueCommand safely
- * @param input input to sanitize into a string
- */
-function toCommandValue(input) {
-    if (input === null || input === undefined) {
-        return '';
-    }
-    else if (typeof input === 'string' || input instanceof String) {
-        return input;
-    }
-    return JSON.stringify(input);
-}
-exports.toCommandValue = toCommandValue;
 function escapeData(s) {
-    return toCommandValue(s)
+    return utils_1.toCommandValue(s)
         .replace(/%/g, '%25')
         .replace(/\r/g, '%0D')
         .replace(/\n/g, '%0A');
 }
 function escapeProperty(s) {
-    return toCommandValue(s)
+    return utils_1.toCommandValue(s)
         .replace(/%/g, '%25')
         .replace(/\r/g, '%0D')
         .replace(/\n/g, '%0A')
@@ -8175,7 +10759,7 @@ module.exports = reusify
 
 
 const fill = __webpack_require__(730);
-const stringify = __webpack_require__(326);
+const stringify = __webpack_require__(382);
 const utils = __webpack_require__(225);
 
 const append = (queue = '', stash = '', enclose = false) => {
@@ -8671,12 +11255,10 @@ AWS.Request = inherit({
     var region = service.config.region;
     var customUserAgent = service.config.customUserAgent;
 
-    if (service.isGlobalEndpoint) {
-      if (service.signingRegion) {
-        region = service.signingRegion;
-      } else {
-        region = 'us-east-1';
-      }
+    if (service.signingRegion) {
+      region = service.signingRegion;
+    } else if (service.isGlobalEndpoint) {
+      region = 'us-east-1';
     }
 
     this.domain = domain && domain.active;
@@ -9143,7 +11725,7 @@ AWS.Request.addPromisesToClass = function addPromisesToClass(PromiseDependency) 
         if (resp.error) {
           reject(resp.error);
         } else {
-          // define $response property so that it is not enumberable
+          // define $response property so that it is not enumerable
           // this prevents circular reference errors when stringifying the JSON object
           resolve(Object.defineProperty(
             resp.data || {},
@@ -9520,6 +12102,25 @@ module.exports = {"application/andrew-inset":["ez"],"application/applixware":["a
 
 "use strict";
 
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
 var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
     function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
     return new (P || (P = Promise))(function (resolve, reject) {
@@ -9529,17 +12130,14 @@ var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, ge
         step((generator = generator.apply(thisArg, _arguments || [])).next());
     });
 };
-var __importStar = (this && this.__importStar) || function (mod) {
-    if (mod && mod.__esModule) return mod;
-    var result = {};
-    if (mod != null) for (var k in mod) if (Object.hasOwnProperty.call(mod, k)) result[k] = mod[k];
-    result["default"] = mod;
-    return result;
-};
 Object.defineProperty(exports, "__esModule", { value: true });
+exports.getIDToken = exports.getState = exports.saveState = exports.group = exports.endGroup = exports.startGroup = exports.info = exports.notice = exports.warning = exports.error = exports.debug = exports.isDebug = exports.setFailed = exports.setCommandEcho = exports.setOutput = exports.getBooleanInput = exports.getMultilineInput = exports.getInput = exports.addPath = exports.setSecret = exports.exportVariable = exports.ExitCode = void 0;
 const command_1 = __webpack_require__(431);
+const file_command_1 = __webpack_require__(102);
+const utils_1 = __webpack_require__(82);
 const os = __importStar(__webpack_require__(87));
 const path = __importStar(__webpack_require__(622));
+const oidc_utils_1 = __webpack_require__(742);
 /**
  * The code to exit an action
  */
@@ -9564,8 +12162,12 @@ var ExitCode;
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function exportVariable(name, val) {
-    const convertedVal = command_1.toCommandValue(val);
+    const convertedVal = utils_1.toCommandValue(val);
     process.env[name] = convertedVal;
+    const filePath = process.env['GITHUB_ENV'] || '';
+    if (filePath) {
+        return file_command_1.issueFileCommand('ENV', file_command_1.prepareKeyValueMessage(name, val));
+    }
     command_1.issueCommand('set-env', { name }, convertedVal);
 }
 exports.exportVariable = exportVariable;
@@ -9582,12 +12184,20 @@ exports.setSecret = setSecret;
  * @param inputPath
  */
 function addPath(inputPath) {
-    command_1.issueCommand('add-path', {}, inputPath);
+    const filePath = process.env['GITHUB_PATH'] || '';
+    if (filePath) {
+        file_command_1.issueFileCommand('PATH', inputPath);
+    }
+    else {
+        command_1.issueCommand('add-path', {}, inputPath);
+    }
     process.env['PATH'] = `${inputPath}${path.delimiter}${process.env['PATH']}`;
 }
 exports.addPath = addPath;
 /**
- * Gets the value of an input.  The value is also trimmed.
+ * Gets the value of an input.
+ * Unless trimWhitespace is set to false in InputOptions, the value is also trimmed.
+ * Returns an empty string if the value is not defined.
  *
  * @param     name     name of the input to get
  * @param     options  optional. See InputOptions.
@@ -9598,9 +12208,52 @@ function getInput(name, options) {
     if (options && options.required && !val) {
         throw new Error(`Input required and not supplied: ${name}`);
     }
+    if (options && options.trimWhitespace === false) {
+        return val;
+    }
     return val.trim();
 }
 exports.getInput = getInput;
+/**
+ * Gets the values of an multiline input.  Each value is also trimmed.
+ *
+ * @param     name     name of the input to get
+ * @param     options  optional. See InputOptions.
+ * @returns   string[]
+ *
+ */
+function getMultilineInput(name, options) {
+    const inputs = getInput(name, options)
+        .split('\n')
+        .filter(x => x !== '');
+    if (options && options.trimWhitespace === false) {
+        return inputs;
+    }
+    return inputs.map(input => input.trim());
+}
+exports.getMultilineInput = getMultilineInput;
+/**
+ * Gets the input value of the boolean type in the YAML 1.2 "core schema" specification.
+ * Support boolean input list: `true | True | TRUE | false | False | FALSE` .
+ * The return value is also in boolean type.
+ * ref: https://yaml.org/spec/1.2/spec.html#id2804923
+ *
+ * @param     name     name of the input to get
+ * @param     options  optional. See InputOptions.
+ * @returns   boolean
+ */
+function getBooleanInput(name, options) {
+    const trueValue = ['true', 'True', 'TRUE'];
+    const falseValue = ['false', 'False', 'FALSE'];
+    const val = getInput(name, options);
+    if (trueValue.includes(val))
+        return true;
+    if (falseValue.includes(val))
+        return false;
+    throw new TypeError(`Input does not meet YAML 1.2 "Core Schema" specification: ${name}\n` +
+        `Support boolean input list: \`true | True | TRUE | false | False | FALSE\``);
+}
+exports.getBooleanInput = getBooleanInput;
 /**
  * Sets the value of an output.
  *
@@ -9609,7 +12262,12 @@ exports.getInput = getInput;
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function setOutput(name, value) {
-    command_1.issueCommand('set-output', { name }, value);
+    const filePath = process.env['GITHUB_OUTPUT'] || '';
+    if (filePath) {
+        return file_command_1.issueFileCommand('OUTPUT', file_command_1.prepareKeyValueMessage(name, value));
+    }
+    process.stdout.write(os.EOL);
+    command_1.issueCommand('set-output', { name }, utils_1.toCommandValue(value));
 }
 exports.setOutput = setOutput;
 /**
@@ -9655,19 +12313,30 @@ exports.debug = debug;
 /**
  * Adds an error issue
  * @param message error issue message. Errors will be converted to string via toString()
+ * @param properties optional properties to add to the annotation.
  */
-function error(message) {
-    command_1.issue('error', message instanceof Error ? message.toString() : message);
+function error(message, properties = {}) {
+    command_1.issueCommand('error', utils_1.toCommandProperties(properties), message instanceof Error ? message.toString() : message);
 }
 exports.error = error;
 /**
- * Adds an warning issue
+ * Adds a warning issue
  * @param message warning issue message. Errors will be converted to string via toString()
+ * @param properties optional properties to add to the annotation.
  */
-function warning(message) {
-    command_1.issue('warning', message instanceof Error ? message.toString() : message);
+function warning(message, properties = {}) {
+    command_1.issueCommand('warning', utils_1.toCommandProperties(properties), message instanceof Error ? message.toString() : message);
 }
 exports.warning = warning;
+/**
+ * Adds a notice issue
+ * @param message notice issue message. Errors will be converted to string via toString()
+ * @param properties optional properties to add to the annotation.
+ */
+function notice(message, properties = {}) {
+    command_1.issueCommand('notice', utils_1.toCommandProperties(properties), message instanceof Error ? message.toString() : message);
+}
+exports.notice = notice;
 /**
  * Writes info to log with console.log.
  * @param message info message
@@ -9727,7 +12396,11 @@ exports.group = group;
  */
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function saveState(name, value) {
-    command_1.issueCommand('save-state', { name }, value);
+    const filePath = process.env['GITHUB_STATE'] || '';
+    if (filePath) {
+        return file_command_1.issueFileCommand('STATE', file_command_1.prepareKeyValueMessage(name, value));
+    }
+    command_1.issueCommand('save-state', { name }, utils_1.toCommandValue(value));
 }
 exports.saveState = saveState;
 /**
@@ -9740,6 +12413,29 @@ function getState(name) {
     return process.env[`STATE_${name}`] || '';
 }
 exports.getState = getState;
+function getIDToken(aud) {
+    return __awaiter(this, void 0, void 0, function* () {
+        return yield oidc_utils_1.OidcClient.getIDToken(aud);
+    });
+}
+exports.getIDToken = getIDToken;
+/**
+ * Summary exports
+ */
+var summary_1 = __webpack_require__(665);
+Object.defineProperty(exports, "summary", { enumerable: true, get: function () { return summary_1.summary; } });
+/**
+ * @deprecated use core.summary
+ */
+var summary_2 = __webpack_require__(665);
+Object.defineProperty(exports, "markdownSummary", { enumerable: true, get: function () { return summary_2.markdownSummary; } });
+/**
+ * Path exports
+ */
+var path_utils_1 = __webpack_require__(573);
+Object.defineProperty(exports, "toPosixPath", { enumerable: true, get: function () { return path_utils_1.toPosixPath; } });
+Object.defineProperty(exports, "toWin32Path", { enumerable: true, get: function () { return path_utils_1.toWin32Path; } });
+Object.defineProperty(exports, "toPlatformPath", { enumerable: true, get: function () { return path_utils_1.toPlatformPath; } });
 //# sourceMappingURL=core.js.map
 
 /***/ }),
@@ -9890,7 +12586,60 @@ exports.getState = getState;
 /* 483 */,
 /* 484 */,
 /* 485 */,
-/* 486 */,
+/* 486 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+/*!
+ * is-glob <https://github.com/jonschlinkert/is-glob>
+ *
+ * Copyright (c) 2014-2017, Jon Schlinkert.
+ * Released under the MIT License.
+ */
+
+var isExtglob = __webpack_require__(999);
+var chars = { '{': '}', '(': ')', '[': ']'};
+var strictRegex = /\\(.)|(^!|\*|[\].+)]\?|\[[^\\\]]+\]|\{[^\\}]+\}|\(\?[:!=][^\\)]+\)|\([^|]+\|[^\\)]+\))/;
+var relaxedRegex = /\\(.)|(^!|[*?{}()[\]]|\(\?)/;
+
+module.exports = function isGlob(str, options) {
+  if (typeof str !== 'string' || str === '') {
+    return false;
+  }
+
+  if (isExtglob(str)) {
+    return true;
+  }
+
+  var regex = strictRegex;
+  var match;
+
+  // optionally relax regex
+  if (options && options.strict === false) {
+    regex = relaxedRegex;
+  }
+
+  while ((match = regex.exec(str))) {
+    if (match[2]) return true;
+    var idx = match.index + match[0].length;
+
+    // if an open bracket/brace/paren is escaped,
+    // set the index to the next closing character
+    var open = match[1];
+    var close = open ? chars[open] : null;
+    if (open && close) {
+      var n = str.indexOf(close, idx);
+      if (n !== -1) {
+        idx = n + 1;
+      }
+    }
+
+    str = str.slice(idx);
+  }
+  return false;
+};
+
+
+/***/ }),
 /* 487 */,
 /* 488 */,
 /* 489 */,
@@ -10049,7 +12798,35 @@ module.exports = XmlBuilder;
 /* 495 */,
 /* 496 */,
 /* 497 */,
-/* 498 */,
+/* 498 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _crypto = _interopRequireDefault(__webpack_require__(417));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function sha1(bytes) {
+  if (Array.isArray(bytes)) {
+    bytes = Buffer.from(bytes);
+  } else if (typeof bytes === 'string') {
+    bytes = Buffer.from(bytes, 'utf8');
+  }
+
+  return _crypto.default.createHash('sha1').update(bytes).digest();
+}
+
+var _default = sha1;
+exports.default = _default;
+
+/***/ }),
 /* 499 */,
 /* 500 */,
 /* 501 */
@@ -10061,7 +12838,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.string = exports.stream = exports.pattern = exports.path = exports.fs = exports.errno = exports.array = void 0;
 const array = __webpack_require__(231);
 exports.array = array;
-const errno = __webpack_require__(115);
+const errno = __webpack_require__(770);
 exports.errno = errno;
 const fs = __webpack_require__(676);
 exports.fs = fs;
@@ -10086,6 +12863,7 @@ var regionConfig = __webpack_require__(546);
 
 var inherit = AWS.util.inherit;
 var clientCount = 0;
+var region_utils = __webpack_require__(171);
 
 /**
  * The service class representing an AWS service.
@@ -10107,6 +12885,24 @@ AWS.Service = inherit({
       throw AWS.util.error(new Error(),
         'Service must be constructed with `new\' operator');
     }
+
+    if (config) {
+      if (config.region) {
+        var region = config.region;
+        if (region_utils.isFipsRegion(region)) {
+          config.region = region_utils.getRealRegion(region);
+          config.useFipsEndpoint = true;
+        }
+        if (region_utils.isGlobalRegion(region)) {
+          config.region = region_utils.getRealRegion(region);
+        }
+      }
+      if (typeof config.useDualstack === 'boolean'
+        && typeof config.useDualstackEndpoint !== 'boolean') {
+        config.useDualstackEndpoint = config.useDualstack;
+      }
+    }
+
     var ServiceClass = this.loadServiceClass(config || {});
     if (ServiceClass) {
       var originalConfig = AWS.util.copy(config);
@@ -10537,6 +13333,14 @@ AWS.Service = inherit({
   },
 
   /**
+   * Gets the signing name for a given request
+   * @api private
+   */
+  getSigningName: function getSigningName() {
+    return this.api.signingName || this.api.endpointPrefix;
+  },
+
+  /**
    * Gets the signer class for a given request
    * @api private
    */
@@ -10554,6 +13358,8 @@ AWS.Service = inherit({
       version = this.config.signatureVersion;
     } else if (authtype === 'v4' || authtype === 'v4-unsigned-body') {
       version = 'v4';
+    } else if (authtype === 'bearer') {
+      version = 'bearer';
     } else {
       version = this.api.signatureVersion;
     }
@@ -10910,7 +13716,36 @@ module.exports = AWS.Service;
 /***/ }),
 /* 504 */,
 /* 505 */,
-/* 506 */,
+/* 506 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = rng;
+
+var _crypto = _interopRequireDefault(__webpack_require__(417));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+const rnds8Pool = new Uint8Array(256); // # of random values to pre-allocate
+
+let poolPtr = rnds8Pool.length;
+
+function rng() {
+  if (poolPtr > rnds8Pool.length - 16) {
+    _crypto.default.randomFillSync(rnds8Pool);
+
+    poolPtr = 0;
+  }
+
+  return rnds8Pool.slice(poolPtr, poolPtr += 16);
+}
+
+/***/ }),
 /* 507 */,
 /* 508 */,
 /* 509 */,
@@ -11028,7 +13863,7 @@ exports.default = Settings;
 "use strict";
 
 Object.defineProperty(exports, "__esModule", { value: true });
-const fsStat = __webpack_require__(858);
+const fsStat = __webpack_require__(109);
 const fsWalk = __webpack_require__(522);
 const reader_1 = __webpack_require__(949);
 class ReaderSync extends reader_1.default {
@@ -11115,7 +13950,20 @@ function getSettings(settingsOrOptions = {}) {
 /***/ }),
 /* 523 */,
 /* 524 */,
-/* 525 */,
+/* 525 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+var _default = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}|00000000-0000-0000-0000-000000000000)$/i;
+exports.default = _default;
+
+/***/ }),
 /* 526 */,
 /* 527 */,
 /* 528 */,
@@ -11529,7 +14377,7 @@ module.exports = scan;
  * Copyright (c) 2014-2020 Teambition
  * Licensed under the MIT license.
  */
-const Stream = __webpack_require__(413)
+const Stream = __webpack_require__(794)
 const PassThrough = Stream.PassThrough
 const slice = Array.prototype.slice
 
@@ -11676,7 +14524,7 @@ function pauseStreams (streams, options) {
 /***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
 
 var AWS = __webpack_require__(395);
-var STS = __webpack_require__(733);
+var STS = __webpack_require__(106);
 
 /**
  * Represents temporary credentials retrieved from {AWS.STS}. Without any
@@ -11884,11 +14732,10 @@ AWS.ChainableTemporaryCredentials = AWS.util.inherit(AWS.Credentials, {
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
 var util = __webpack_require__(954);
-var regionConfig = __webpack_require__(572);
+var regionConfig = __webpack_require__(108);
 
 function generateRegionPrefix(region) {
   if (!region) return null;
-
   var parts = region.split('-');
   if (parts.length < 3) return null;
   return parts.slice(0, parts.length - 2).join('-') + '-*';
@@ -11922,23 +14769,24 @@ function applyConfig(service, config) {
 
 function configureEndpoint(service) {
   var keys = derivedKeys(service);
+  var useFipsEndpoint = service.config.useFipsEndpoint;
+  var useDualstackEndpoint = service.config.useDualstackEndpoint;
   for (var i = 0; i < keys.length; i++) {
     var key = keys[i];
     if (!key) continue;
 
-    if (Object.prototype.hasOwnProperty.call(regionConfig.rules, key)) {
-      var config = regionConfig.rules[key];
+    var rules = useFipsEndpoint
+      ? useDualstackEndpoint
+        ? regionConfig.dualstackFipsRules
+        : regionConfig.fipsRules
+      : useDualstackEndpoint
+      ? regionConfig.dualstackRules
+      : regionConfig.rules;
+
+    if (Object.prototype.hasOwnProperty.call(rules, key)) {
+      var config = rules[key];
       if (typeof config === 'string') {
         config = regionConfig.patterns[config];
-      }
-
-      // set dualstack endpoint
-      if (service.config.useDualstack && util.isDualstackAvailable(service)) {
-        config = util.copy(config);
-        config.endpoint = config.endpoint.replace(
-          /{service}\.({region}\.)?/,
-          '{service}.dualstack.{region}.'
-        );
       }
 
       // set global endpoint
@@ -11948,10 +14796,21 @@ function configureEndpoint(service) {
       }
 
       // signature version
-      if (!config.signatureVersion) config.signatureVersion = 'v4';
+      if (!config.signatureVersion) {
+        // Note: config is a global object and should not be mutated here.
+        // However, we are retaining this line for backwards compatibility.
+        // The non-v4 signatureVersion will be set in a copied object below.
+        config.signatureVersion = 'v4';
+      }
+
+      var useBearer = (service.api && service.api.signatureVersion) === 'bearer';
 
       // merge config
-      applyConfig(service, config);
+      applyConfig(service, Object.assign(
+        {},
+        config,
+        { signatureVersion: useBearer ? 'bearer' : config.signatureVersion }
+      ));
       return;
     }
   }
@@ -11980,7 +14839,7 @@ function getEndpointSuffix(region) {
  */
 module.exports = {
   configureEndpoint: configureEndpoint,
-  getEndpointSuffix: getEndpointSuffix
+  getEndpointSuffix: getEndpointSuffix,
 };
 
 
@@ -11992,7 +14851,93 @@ module.exports = {
 /* 551 */,
 /* 552 */,
 /* 553 */,
-/* 554 */,
+/* 554 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.PersonalAccessTokenCredentialHandler = exports.BearerCredentialHandler = exports.BasicCredentialHandler = void 0;
+class BasicCredentialHandler {
+    constructor(username, password) {
+        this.username = username;
+        this.password = password;
+    }
+    prepareRequest(options) {
+        if (!options.headers) {
+            throw Error('The request has no headers');
+        }
+        options.headers['Authorization'] = `Basic ${Buffer.from(`${this.username}:${this.password}`).toString('base64')}`;
+    }
+    // This handler cannot handle 401
+    canHandleAuthentication() {
+        return false;
+    }
+    handleAuthentication() {
+        return __awaiter(this, void 0, void 0, function* () {
+            throw new Error('not implemented');
+        });
+    }
+}
+exports.BasicCredentialHandler = BasicCredentialHandler;
+class BearerCredentialHandler {
+    constructor(token) {
+        this.token = token;
+    }
+    // currently implements pre-authorization
+    // TODO: support preAuth = false where it hooks on 401
+    prepareRequest(options) {
+        if (!options.headers) {
+            throw Error('The request has no headers');
+        }
+        options.headers['Authorization'] = `Bearer ${this.token}`;
+    }
+    // This handler cannot handle 401
+    canHandleAuthentication() {
+        return false;
+    }
+    handleAuthentication() {
+        return __awaiter(this, void 0, void 0, function* () {
+            throw new Error('not implemented');
+        });
+    }
+}
+exports.BearerCredentialHandler = BearerCredentialHandler;
+class PersonalAccessTokenCredentialHandler {
+    constructor(token) {
+        this.token = token;
+    }
+    // currently implements pre-authorization
+    // TODO: support preAuth = false where it hooks on 401
+    prepareRequest(options) {
+        if (!options.headers) {
+            throw Error('The request has no headers');
+        }
+        options.headers['Authorization'] = `Basic ${Buffer.from(`PAT:${this.token}`).toString('base64')}`;
+    }
+    // This handler cannot handle 401
+    canHandleAuthentication() {
+        return false;
+    }
+    handleAuthentication() {
+        return __awaiter(this, void 0, void 0, function* () {
+            throw new Error('not implemented');
+        });
+    }
+}
+exports.PersonalAccessTokenCredentialHandler = PersonalAccessTokenCredentialHandler;
+//# sourceMappingURL=auth.js.map
+
+/***/ }),
 /* 555 */,
 /* 556 */,
 /* 557 */,
@@ -12094,12 +15039,91 @@ module.exports = AWS.Signers.V3Https;
 /* 570 */,
 /* 571 */,
 /* 572 */
-/***/ (function(module) {
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
-module.exports = {"rules":{"*/*":{"endpoint":"{service}.{region}.amazonaws.com"},"cn-*/*":{"endpoint":"{service}.{region}.amazonaws.com.cn"},"us-iso-*/*":{"endpoint":"{service}.{region}.c2s.ic.gov"},"us-isob-*/*":{"endpoint":"{service}.{region}.sc2s.sgov.gov"},"*/budgets":"globalSSL","*/cloudfront":"globalSSL","*/sts":"globalSSL","*/importexport":{"endpoint":"{service}.amazonaws.com","signatureVersion":"v2","globalEndpoint":true},"*/route53":"globalSSL","cn-*/route53":{"endpoint":"{service}.amazonaws.com.cn","globalEndpoint":true,"signingRegion":"cn-northwest-1"},"us-gov-*/route53":"globalGovCloud","*/waf":"globalSSL","*/iam":"globalSSL","cn-*/iam":{"endpoint":"{service}.cn-north-1.amazonaws.com.cn","globalEndpoint":true,"signingRegion":"cn-north-1"},"us-gov-*/iam":"globalGovCloud","us-gov-*/sts":{"endpoint":"{service}.{region}.amazonaws.com"},"us-gov-west-1/s3":"s3signature","us-west-1/s3":"s3signature","us-west-2/s3":"s3signature","eu-west-1/s3":"s3signature","ap-southeast-1/s3":"s3signature","ap-southeast-2/s3":"s3signature","ap-northeast-1/s3":"s3signature","sa-east-1/s3":"s3signature","us-east-1/s3":{"endpoint":"{service}.amazonaws.com","signatureVersion":"s3"},"us-east-1/sdb":{"endpoint":"{service}.amazonaws.com","signatureVersion":"v2"},"*/sdb":{"endpoint":"{service}.{region}.amazonaws.com","signatureVersion":"v2"}},"patterns":{"globalSSL":{"endpoint":"https://{service}.amazonaws.com","globalEndpoint":true,"signingRegion":"us-east-1"},"globalGovCloud":{"endpoint":"{service}.us-gov.amazonaws.com","globalEndpoint":true,"signingRegion":"us-gov-west-1"},"s3signature":{"endpoint":"{service}.{region}.amazonaws.com","signatureVersion":"s3"}}};
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _v = _interopRequireDefault(__webpack_require__(136));
+
+var _md = _interopRequireDefault(__webpack_require__(659));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+const v3 = (0, _v.default)('v3', 0x30, _md.default);
+var _default = v3;
+exports.default = _default;
 
 /***/ }),
-/* 573 */,
+/* 573 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    Object.defineProperty(o, k2, { enumerable: true, get: function() { return m[k]; } });
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || function (mod) {
+    if (mod && mod.__esModule) return mod;
+    var result = {};
+    if (mod != null) for (var k in mod) if (k !== "default" && Object.hasOwnProperty.call(mod, k)) __createBinding(result, mod, k);
+    __setModuleDefault(result, mod);
+    return result;
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.toPlatformPath = exports.toWin32Path = exports.toPosixPath = void 0;
+const path = __importStar(__webpack_require__(622));
+/**
+ * toPosixPath converts the given path to the posix form. On Windows, \\ will be
+ * replaced with /.
+ *
+ * @param pth. Path to transform.
+ * @return string Posix path.
+ */
+function toPosixPath(pth) {
+    return pth.replace(/[\\]/g, '/');
+}
+exports.toPosixPath = toPosixPath;
+/**
+ * toWin32Path converts the given path to the win32 form. On Linux, / will be
+ * replaced with \\.
+ *
+ * @param pth. Path to transform.
+ * @return string Win32 path.
+ */
+function toWin32Path(pth) {
+    return pth.replace(/[/]/g, '\\');
+}
+exports.toWin32Path = toWin32Path;
+/**
+ * toPlatformPath converts the given path to a platform-specific path. It does
+ * this by replacing instances of / and \ with the platform-specific path
+ * separator.
+ *
+ * @param pth The path to platformize.
+ * @return string The platform-specific path.
+ */
+function toPlatformPath(pth) {
+    return pth.replace(/[/\\]/g, path.sep);
+}
+exports.toPlatformPath = toPlatformPath;
+//# sourceMappingURL=path-utils.js.map
+
+/***/ }),
 /* 574 */,
 /* 575 */,
 /* 576 */
@@ -12335,7 +15359,20 @@ module.exports = Collection;
 /* 584 */,
 /* 585 */,
 /* 586 */,
-/* 587 */,
+/* 587 */
+/***/ (function(module) {
+
+var getEndpointMode = function() {
+  return {
+    IPv4: 'IPv4',
+    IPv6: 'IPv6',
+  };
+};
+
+module.exports = getEndpointMode;
+
+
+/***/ }),
 /* 588 */,
 /* 589 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
@@ -12425,7 +15462,20 @@ exports.read = read;
 
 /***/ }),
 /* 594 */,
-/* 595 */,
+/* 595 */
+/***/ (function(module) {
+
+var getEndpoint = function() {
+  return {
+    IPv4: 'http://169.254.169.254',
+    IPv6: 'http://[fd00:ec2::254]',
+  };
+};
+
+module.exports = getEndpoint;
+
+
+/***/ }),
 /* 596 */,
 /* 597 */,
 /* 598 */,
@@ -12604,102 +15654,9 @@ exports.read = read;
 /* 603 */,
 /* 604 */,
 /* 605 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
+/***/ (function(module) {
 
-var util = __webpack_require__(395).util;
-var toBuffer = util.buffer.toBuffer;
-
-/**
- * A lossless representation of a signed, 64-bit integer. Instances of this
- * class may be used in arithmetic expressions as if they were numeric
- * primitives, but the binary representation will be preserved unchanged as the
- * `bytes` property of the object. The bytes should be encoded as big-endian,
- * two's complement integers.
- * @param {Buffer} bytes
- *
- * @api private
- */
-function Int64(bytes) {
-    if (bytes.length !== 8) {
-        throw new Error('Int64 buffers must be exactly 8 bytes');
-    }
-    if (!util.Buffer.isBuffer(bytes)) bytes = toBuffer(bytes);
-
-    this.bytes = bytes;
-}
-
-/**
- * @param {number} number
- * @returns {Int64}
- *
- * @api private
- */
-Int64.fromNumber = function(number) {
-    if (number > 9223372036854775807 || number < -9223372036854775808) {
-        throw new Error(
-            number + ' is too large (or, if negative, too small) to represent as an Int64'
-        );
-    }
-
-    var bytes = new Uint8Array(8);
-    for (
-        var i = 7, remaining = Math.abs(Math.round(number));
-        i > -1 && remaining > 0;
-        i--, remaining /= 256
-    ) {
-        bytes[i] = remaining;
-    }
-
-    if (number < 0) {
-        negate(bytes);
-    }
-
-    return new Int64(bytes);
-};
-
-/**
- * @returns {number}
- *
- * @api private
- */
-Int64.prototype.valueOf = function() {
-    var bytes = this.bytes.slice(0);
-    var negative = bytes[0] & 128;
-    if (negative) {
-        negate(bytes);
-    }
-
-    return parseInt(bytes.toString('hex'), 16) * (negative ? -1 : 1);
-};
-
-Int64.prototype.toString = function() {
-    return String(this.valueOf());
-};
-
-/**
- * @param {Buffer} bytes
- *
- * @api private
- */
-function negate(bytes) {
-    for (var i = 0; i < 8; i++) {
-        bytes[i] ^= 0xFF;
-    }
-    for (var i = 7; i > -1; i--) {
-        bytes[i]++;
-        if (bytes[i] !== 0) {
-            break;
-        }
-    }
-}
-
-/**
- * @api private
- */
-module.exports = {
-    Int64: Int64
-};
-
+module.exports = require("http");
 
 /***/ }),
 /* 606 */
@@ -12780,18 +15737,52 @@ function getOperationAuthtype(req) {
   return operation ? operation.authtype : '';
 }
 
+/**
+ * @api private
+ */
+function getIdentityType(req) {
+  var service = req.service;
+
+  if (service.config.signatureVersion) {
+    return service.config.signatureVersion;
+  }
+
+  if (service.api.signatureVersion) {
+    return service.api.signatureVersion;
+  }
+
+  return getOperationAuthtype(req);
+}
+
 AWS.EventListeners = {
   Core: new SequentialExecutor().addNamedListeners(function(add, addAsync) {
-    addAsync('VALIDATE_CREDENTIALS', 'validate',
-        function VALIDATE_CREDENTIALS(req, done) {
-      if (!req.service.api.signatureVersion && !req.service.config.signatureVersion) return done(); // none
-      req.service.config.getCredentials(function(err) {
-        if (err) {
-          req.response.error = AWS.util.error(err,
-            {code: 'CredentialsError', message: 'Missing credentials in config, if using AWS_CONFIG_FILE, set AWS_SDK_LOAD_CONFIG=1'});
+    addAsync(
+      'VALIDATE_CREDENTIALS', 'validate',
+      function VALIDATE_CREDENTIALS(req, done) {
+        if (!req.service.api.signatureVersion && !req.service.config.signatureVersion) return done(); // none
+
+        var identityType = getIdentityType(req);
+        if (identityType === 'bearer') {
+          req.service.config.getToken(function(err) {
+            if (err) {
+              req.response.error = AWS.util.error(err, {code: 'TokenError'});
+            }
+            done();
+          });
+          return;
         }
-        done();
-      });
+
+        req.service.config.getCredentials(function(err) {
+          if (err) {
+            req.response.error = AWS.util.error(err,
+              {
+                code: 'CredentialsError',
+                message: 'Missing credentials in config, if using AWS_CONFIG_FILE, set AWS_SDK_LOAD_CONFIG=1'
+              }
+            );
+          }
+          done();
+        });
     });
 
     add('VALIDATE_REGION', 'validate', function VALIDATE_REGION(req) {
@@ -12837,6 +15828,28 @@ AWS.EventListeners = {
       var rules = req.service.api.operations[req.operation].input;
       var validation = req.service.config.paramValidation;
       new AWS.ParamValidator(validation).validate(rules, req.params);
+    });
+
+    add('COMPUTE_CHECKSUM', 'afterBuild', function COMPUTE_CHECKSUM(req) {
+      if (!req.service.api.operations) {
+        return;
+      }
+      var operation = req.service.api.operations[req.operation];
+      if (!operation) {
+        return;
+      }
+      var body = req.httpRequest.body;
+      var isNonStreamingPayload = body && (AWS.util.Buffer.isBuffer(body) || typeof body === 'string');
+      var headers = req.httpRequest.headers;
+      if (
+        operation.httpChecksumRequired &&
+        req.service.config.computeChecksums &&
+        isNonStreamingPayload &&
+        !headers['Content-MD5']
+      ) {
+        var md5 = AWS.util.crypto.md5(body, 'base64');
+        headers['Content-MD5'] = md5;
+      }
     });
 
     addAsync('COMPUTE_SHA256', 'afterBuild', function COMPUTE_SHA256(req, done) {
@@ -12896,6 +15909,24 @@ AWS.EventListeners = {
       req.httpRequest.headers['Host'] = req.httpRequest.endpoint.host;
     });
 
+    add('SET_TRACE_ID', 'afterBuild', function SET_TRACE_ID(req) {
+      var traceIdHeaderName = 'X-Amzn-Trace-Id';
+      if (AWS.util.isNode() && !Object.hasOwnProperty.call(req.httpRequest.headers, traceIdHeaderName)) {
+        var ENV_LAMBDA_FUNCTION_NAME = 'AWS_LAMBDA_FUNCTION_NAME';
+        var ENV_TRACE_ID = '_X_AMZN_TRACE_ID';
+        var functionName = process.env[ENV_LAMBDA_FUNCTION_NAME];
+        var traceId = process.env[ENV_TRACE_ID];
+        if (
+          typeof functionName === 'string' &&
+          functionName.length > 0 &&
+          typeof traceId === 'string' &&
+          traceId.length > 0
+        ) {
+          req.httpRequest.headers[traceIdHeaderName] = traceId;
+        }
+      }
+    });
+
     add('RESTART', 'restart', function RESTART() {
       var err = this.response.error;
       if (!err || !err.retryable) return;
@@ -12917,42 +15948,61 @@ AWS.EventListeners = {
 
     addAsync('SIGN', 'sign', function SIGN(req, done) {
       var service = req.service;
-      var operations = req.service.api.operations || {};
-      var operation = operations[req.operation];
-      var authtype = operation ? operation.authtype : '';
-      if (!service.api.signatureVersion && !authtype && !service.config.signatureVersion) return done(); // none
+      var identityType = getIdentityType(req);
+      if (!identityType || identityType.length === 0) return done(); // none
 
-      service.config.getCredentials(function (err, credentials) {
-        if (err) {
-          req.response.error = err;
-          return done();
-        }
+      if (identityType === 'bearer') {
+        service.config.getToken(function (err, token) {
+          if (err) {
+            req.response.error = err;
+            return done();
+          }
 
-        try {
-          var date = service.getSkewCorrectedDate();
-          var SignerClass = service.getSignerClass(req);
-          var signer = new SignerClass(req.httpRequest,
-            service.api.signingName || service.api.endpointPrefix,
-            {
-              signatureCache: service.config.signatureCache,
-              operation: operation,
-              signatureVersion: service.api.signatureVersion
-            });
-          signer.setServiceClientId(service._clientId);
+          try {
+            var SignerClass = service.getSignerClass(req);
+            var signer = new SignerClass(req.httpRequest);
+            signer.addAuthorization(token);
+          } catch (e) {
+            req.response.error = e;
+          }
+          done();
+        });
+      } else {
+        service.config.getCredentials(function (err, credentials) {
+          if (err) {
+            req.response.error = err;
+            return done();
+          }
 
-          // clear old authorization headers
-          delete req.httpRequest.headers['Authorization'];
-          delete req.httpRequest.headers['Date'];
-          delete req.httpRequest.headers['X-Amz-Date'];
+          try {
+            var date = service.getSkewCorrectedDate();
+            var SignerClass = service.getSignerClass(req);
+            var operations = req.service.api.operations || {};
+            var operation = operations[req.operation];
+            var signer = new SignerClass(req.httpRequest,
+              service.getSigningName(req),
+              {
+                signatureCache: service.config.signatureCache,
+                operation: operation,
+                signatureVersion: service.api.signatureVersion
+              });
+            signer.setServiceClientId(service._clientId);
 
-          // add new authorization
-          signer.addAuthorization(credentials, date);
-          req.signedAt = date;
-        } catch (e) {
-          req.response.error = e;
-        }
-        done();
-      });
+            // clear old authorization headers
+            delete req.httpRequest.headers['Authorization'];
+            delete req.httpRequest.headers['Date'];
+            delete req.httpRequest.headers['X-Amz-Date'];
+
+            // add new authorization
+            signer.addAuthorization(credentials, date);
+            req.signedAt = date;
+          } catch (e) {
+            req.response.error = e;
+          }
+          done();
+        });
+
+      }
     });
 
     add('VALIDATE_RESPONSE', 'validateResponse', function VALIDATE_RESPONSE(resp) {
@@ -12965,6 +16015,17 @@ AWS.EventListeners = {
           {code: 'UnknownError', message: 'An unknown error occurred.'});
       }
     });
+
+    add('ERROR', 'error', function ERROR(err, resp) {
+      var awsQueryCompatible = resp.request.service.api.awsQueryCompatible;
+      if (awsQueryCompatible) {
+        var headers = resp.httpResponse.headers;
+        var queryErrorCode = headers ? headers['x-amzn-query-error'] : undefined;
+        if (queryErrorCode && queryErrorCode.includes(';')) {
+          resp.error.code = queryErrorCode.split(';')[0];
+        }
+      }
+    }, true);
 
     addAsync('SEND', 'send', function SEND(resp, done) {
       resp.httpResponse._abortCallback = done;
@@ -13201,8 +16262,14 @@ AWS.EventListeners = {
     add('EXTRACT_REQUEST_ID', 'extractError', AWS.util.extractRequestId);
 
     add('ENOTFOUND_ERROR', 'httpError', function ENOTFOUND_ERROR(err) {
-      if (err.code === 'NetworkingError' && err.errno === 'ENOTFOUND') {
-        var message = 'Inaccessible host: `' + err.hostname +
+      function isDNSError(err) {
+        return err.errno === 'ENOTFOUND' ||
+          typeof err.errno === 'number' &&
+          typeof AWS.util.getSystemErrorName === 'function' &&
+          ['EAI_NONAME', 'EAI_NODATA'].indexOf(AWS.util.getSystemErrorName(err.errno) >= 0);
+      }
+      if (err.code === 'NetworkingError' && isDNSError(err)) {
+        var message = 'Inaccessible host: `' + err.hostname + '\' at port `' + err.port +
           '\'. This service may not be available in the `' + err.region +
           '\' region.';
         this.response.error = AWS.util.error(new Error(message), {
@@ -13310,6 +16377,7 @@ AWS.EventListeners = {
     add('BUILD', 'build', svc.buildRequest);
     add('EXTRACT_DATA', 'extractData', svc.extractData);
     add('EXTRACT_ERROR', 'extractError', svc.extractError);
+    add('UNSET_CONTENT_LENGTH', 'afterBuild', svc.unsetContentLength);
   }),
 
   RestXml: new SequentialExecutor().addNamedListeners(function(add) {
@@ -13336,8 +16404,8 @@ AWS.EventListeners = {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", { value: true });
-const stream_1 = __webpack_require__(413);
-const fsStat = __webpack_require__(858);
+const stream_1 = __webpack_require__(794);
+const fsStat = __webpack_require__(109);
 const fsWalk = __webpack_require__(522);
 const reader_1 = __webpack_require__(949);
 class ReaderStream extends reader_1.default {
@@ -14244,87 +17312,62 @@ exports.LRUCache = LRUCache;
 
 /***/ }),
 /* 630 */,
-/* 631 */,
+/* 631 */
+/***/ (function(module) {
+
+module.exports = require("net");
+
+/***/ }),
 /* 632 */,
 /* 633 */,
 /* 634 */
-/***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
-var AWS = __webpack_require__(395);
+"use strict";
 
-/**
- * Represents credentials from a JSON file on disk.
- * If the credentials expire, the SDK can {refresh} the credentials
- * from the file.
- *
- * The format of the file should be similar to the options passed to
- * {AWS.Config}:
- *
- * ```javascript
- * {accessKeyId: 'akid', secretAccessKey: 'secret', sessionToken: 'optional'}
- * ```
- *
- * @example Loading credentials from disk
- *   var creds = new AWS.FileSystemCredentials('./configuration.json');
- *   creds.accessKeyId == 'AKID'
- *
- * @!attribute filename
- *   @readonly
- *   @return [String] the path to the JSON file on disk containing the
- *     credentials.
- * @!macro nobrowser
- */
-AWS.FileSystemCredentials = AWS.util.inherit(AWS.Credentials, {
 
-  /**
-   * @overload AWS.FileSystemCredentials(filename)
-   *   Creates a new FileSystemCredentials object from a filename
-   *
-   *   @param filename [String] the path on disk to the JSON file to load.
-   */
-  constructor: function FileSystemCredentials(filename) {
-    AWS.Credentials.call(this);
-    this.filename = filename;
-    this.get(function() {});
-  },
-
-  /**
-   * Loads the credentials from the {filename} on disk.
-   *
-   * @callback callback function(err)
-   *   Called after the JSON file on disk is read and parsed. When this callback
-   *   is called with no error, it means that the credentials information
-   *   has been loaded into the object (as the `accessKeyId`, `secretAccessKey`,
-   *   and `sessionToken` properties).
-   *   @param err [Error] if an error occurred, this value will be filled
-   * @see get
-   */
-  refresh: function refresh(callback) {
-    if (!callback) callback = AWS.util.fn.callback;
-    try {
-      var creds = JSON.parse(AWS.util.readFileSync(this.filename));
-      AWS.Credentials.call(this, creds);
-      if (!this.accessKeyId || !this.secretAccessKey) {
-        throw AWS.util.error(
-          new Error('Credentials not set in ' + this.filename),
-        { code: 'FileSystemCredentialsProviderFailure' }
-        );
-      }
-      this.expired = false;
-      callback();
-    } catch (err) {
-      callback(err);
-    }
-  }
-
+Object.defineProperty(exports, "__esModule", {
+  value: true
 });
+exports.default = void 0;
 
+var _regex = _interopRequireDefault(__webpack_require__(525));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function validate(uuid) {
+  return typeof uuid === 'string' && _regex.default.test(uuid);
+}
+
+var _default = validate;
+exports.default = _default;
 
 /***/ }),
 /* 635 */,
 /* 636 */,
 /* 637 */,
-/* 638 */,
+/* 638 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _v = _interopRequireDefault(__webpack_require__(136));
+
+var _sha = _interopRequireDefault(__webpack_require__(329));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+const v5 = (0, _v.default)('v5', 0x50, _sha.default);
+var _default = v5;
+exports.default = _default;
+
+/***/ }),
 /* 639 */,
 /* 640 */,
 /* 641 */,
@@ -14496,7 +17539,7 @@ AWS.FileSystemCredentials = AWS.util.inherit(AWS.Credentials, {
 
   var Stream
   try {
-    Stream = __webpack_require__(413).Stream
+    Stream = __webpack_require__(794).Stream
   } catch (ex) {
     Stream = function () {}
   }
@@ -16004,7 +19047,35 @@ module.exports = {
 
 /***/ }),
 /* 658 */,
-/* 659 */,
+/* 659 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _crypto = _interopRequireDefault(__webpack_require__(417));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function md5(bytes) {
+  if (Array.isArray(bytes)) {
+    bytes = Buffer.from(bytes);
+  } else if (typeof bytes === 'string') {
+    bytes = Buffer.from(bytes, 'utf8');
+  }
+
+  return _crypto.default.createHash('md5').update(bytes).digest();
+}
+
+var _default = md5;
+exports.default = _default;
+
+/***/ }),
 /* 660 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -16073,7 +19144,295 @@ module.exports = {
 /* 662 */,
 /* 663 */,
 /* 664 */,
-/* 665 */,
+/* 665 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.summary = exports.markdownSummary = exports.SUMMARY_DOCS_URL = exports.SUMMARY_ENV_VAR = void 0;
+const os_1 = __webpack_require__(87);
+const fs_1 = __webpack_require__(747);
+const { access, appendFile, writeFile } = fs_1.promises;
+exports.SUMMARY_ENV_VAR = 'GITHUB_STEP_SUMMARY';
+exports.SUMMARY_DOCS_URL = 'https://docs.github.com/actions/using-workflows/workflow-commands-for-github-actions#adding-a-job-summary';
+class Summary {
+    constructor() {
+        this._buffer = '';
+    }
+    /**
+     * Finds the summary file path from the environment, rejects if env var is not found or file does not exist
+     * Also checks r/w permissions.
+     *
+     * @returns step summary file path
+     */
+    filePath() {
+        return __awaiter(this, void 0, void 0, function* () {
+            if (this._filePath) {
+                return this._filePath;
+            }
+            const pathFromEnv = process.env[exports.SUMMARY_ENV_VAR];
+            if (!pathFromEnv) {
+                throw new Error(`Unable to find environment variable for $${exports.SUMMARY_ENV_VAR}. Check if your runtime environment supports job summaries.`);
+            }
+            try {
+                yield access(pathFromEnv, fs_1.constants.R_OK | fs_1.constants.W_OK);
+            }
+            catch (_a) {
+                throw new Error(`Unable to access summary file: '${pathFromEnv}'. Check if the file has correct read/write permissions.`);
+            }
+            this._filePath = pathFromEnv;
+            return this._filePath;
+        });
+    }
+    /**
+     * Wraps content in an HTML tag, adding any HTML attributes
+     *
+     * @param {string} tag HTML tag to wrap
+     * @param {string | null} content content within the tag
+     * @param {[attribute: string]: string} attrs key-value list of HTML attributes to add
+     *
+     * @returns {string} content wrapped in HTML element
+     */
+    wrap(tag, content, attrs = {}) {
+        const htmlAttrs = Object.entries(attrs)
+            .map(([key, value]) => ` ${key}="${value}"`)
+            .join('');
+        if (!content) {
+            return `<${tag}${htmlAttrs}>`;
+        }
+        return `<${tag}${htmlAttrs}>${content}</${tag}>`;
+    }
+    /**
+     * Writes text in the buffer to the summary buffer file and empties buffer. Will append by default.
+     *
+     * @param {SummaryWriteOptions} [options] (optional) options for write operation
+     *
+     * @returns {Promise<Summary>} summary instance
+     */
+    write(options) {
+        return __awaiter(this, void 0, void 0, function* () {
+            const overwrite = !!(options === null || options === void 0 ? void 0 : options.overwrite);
+            const filePath = yield this.filePath();
+            const writeFunc = overwrite ? writeFile : appendFile;
+            yield writeFunc(filePath, this._buffer, { encoding: 'utf8' });
+            return this.emptyBuffer();
+        });
+    }
+    /**
+     * Clears the summary buffer and wipes the summary file
+     *
+     * @returns {Summary} summary instance
+     */
+    clear() {
+        return __awaiter(this, void 0, void 0, function* () {
+            return this.emptyBuffer().write({ overwrite: true });
+        });
+    }
+    /**
+     * Returns the current summary buffer as a string
+     *
+     * @returns {string} string of summary buffer
+     */
+    stringify() {
+        return this._buffer;
+    }
+    /**
+     * If the summary buffer is empty
+     *
+     * @returns {boolen} true if the buffer is empty
+     */
+    isEmptyBuffer() {
+        return this._buffer.length === 0;
+    }
+    /**
+     * Resets the summary buffer without writing to summary file
+     *
+     * @returns {Summary} summary instance
+     */
+    emptyBuffer() {
+        this._buffer = '';
+        return this;
+    }
+    /**
+     * Adds raw text to the summary buffer
+     *
+     * @param {string} text content to add
+     * @param {boolean} [addEOL=false] (optional) append an EOL to the raw text (default: false)
+     *
+     * @returns {Summary} summary instance
+     */
+    addRaw(text, addEOL = false) {
+        this._buffer += text;
+        return addEOL ? this.addEOL() : this;
+    }
+    /**
+     * Adds the operating system-specific end-of-line marker to the buffer
+     *
+     * @returns {Summary} summary instance
+     */
+    addEOL() {
+        return this.addRaw(os_1.EOL);
+    }
+    /**
+     * Adds an HTML codeblock to the summary buffer
+     *
+     * @param {string} code content to render within fenced code block
+     * @param {string} lang (optional) language to syntax highlight code
+     *
+     * @returns {Summary} summary instance
+     */
+    addCodeBlock(code, lang) {
+        const attrs = Object.assign({}, (lang && { lang }));
+        const element = this.wrap('pre', this.wrap('code', code), attrs);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML list to the summary buffer
+     *
+     * @param {string[]} items list of items to render
+     * @param {boolean} [ordered=false] (optional) if the rendered list should be ordered or not (default: false)
+     *
+     * @returns {Summary} summary instance
+     */
+    addList(items, ordered = false) {
+        const tag = ordered ? 'ol' : 'ul';
+        const listItems = items.map(item => this.wrap('li', item)).join('');
+        const element = this.wrap(tag, listItems);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML table to the summary buffer
+     *
+     * @param {SummaryTableCell[]} rows table rows
+     *
+     * @returns {Summary} summary instance
+     */
+    addTable(rows) {
+        const tableBody = rows
+            .map(row => {
+            const cells = row
+                .map(cell => {
+                if (typeof cell === 'string') {
+                    return this.wrap('td', cell);
+                }
+                const { header, data, colspan, rowspan } = cell;
+                const tag = header ? 'th' : 'td';
+                const attrs = Object.assign(Object.assign({}, (colspan && { colspan })), (rowspan && { rowspan }));
+                return this.wrap(tag, data, attrs);
+            })
+                .join('');
+            return this.wrap('tr', cells);
+        })
+            .join('');
+        const element = this.wrap('table', tableBody);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds a collapsable HTML details element to the summary buffer
+     *
+     * @param {string} label text for the closed state
+     * @param {string} content collapsable content
+     *
+     * @returns {Summary} summary instance
+     */
+    addDetails(label, content) {
+        const element = this.wrap('details', this.wrap('summary', label) + content);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML image tag to the summary buffer
+     *
+     * @param {string} src path to the image you to embed
+     * @param {string} alt text description of the image
+     * @param {SummaryImageOptions} options (optional) addition image attributes
+     *
+     * @returns {Summary} summary instance
+     */
+    addImage(src, alt, options) {
+        const { width, height } = options || {};
+        const attrs = Object.assign(Object.assign({}, (width && { width })), (height && { height }));
+        const element = this.wrap('img', null, Object.assign({ src, alt }, attrs));
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML section heading element
+     *
+     * @param {string} text heading text
+     * @param {number | string} [level=1] (optional) the heading level, default: 1
+     *
+     * @returns {Summary} summary instance
+     */
+    addHeading(text, level) {
+        const tag = `h${level}`;
+        const allowedTag = ['h1', 'h2', 'h3', 'h4', 'h5', 'h6'].includes(tag)
+            ? tag
+            : 'h1';
+        const element = this.wrap(allowedTag, text);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML thematic break (<hr>) to the summary buffer
+     *
+     * @returns {Summary} summary instance
+     */
+    addSeparator() {
+        const element = this.wrap('hr', null);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML line break (<br>) to the summary buffer
+     *
+     * @returns {Summary} summary instance
+     */
+    addBreak() {
+        const element = this.wrap('br', null);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML blockquote to the summary buffer
+     *
+     * @param {string} text quote text
+     * @param {string} cite (optional) citation url
+     *
+     * @returns {Summary} summary instance
+     */
+    addQuote(text, cite) {
+        const attrs = Object.assign({}, (cite && { cite }));
+        const element = this.wrap('blockquote', text, attrs);
+        return this.addRaw(element).addEOL();
+    }
+    /**
+     * Adds an HTML anchor tag to the summary buffer
+     *
+     * @param {string} text link text/content
+     * @param {string} href hyperlink
+     *
+     * @returns {Summary} summary instance
+     */
+    addLink(text, href) {
+        const element = this.wrap('a', text, { href });
+        return this.addRaw(element).addEOL();
+    }
+}
+const _summary = new Summary();
+/**
+ * @deprecated use `core.summary`
+ */
+exports.markdownSummary = _summary;
+exports.summary = _summary;
+//# sourceMappingURL=summary.js.map
+
+/***/ }),
 /* 666 */,
 /* 667 */,
 /* 668 */,
@@ -16291,6 +19650,7 @@ function StructureShape(shape, options) {
     property(this, 'memberNames', []);
     property(this, 'required', []);
     property(this, 'isRequired', function() { return false; });
+    property(this, 'isDocument', Boolean(shape.document));
   }
 
   if (shape.members) {
@@ -16535,7 +19895,7 @@ module.exports = Shape;
 /* 683 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
-var Int64 = __webpack_require__(605).Int64;
+var Int64 = __webpack_require__(996).Int64;
 
 var splitMessage = __webpack_require__(175).splitMessage;
 
@@ -16965,7 +20325,7 @@ module.exports = {
 /* 694 */
 /***/ (function(module) {
 
-module.exports = {"acm":{"name":"ACM","cors":true},"apigateway":{"name":"APIGateway","cors":true},"applicationautoscaling":{"prefix":"application-autoscaling","name":"ApplicationAutoScaling","cors":true},"appstream":{"name":"AppStream"},"autoscaling":{"name":"AutoScaling","cors":true},"batch":{"name":"Batch"},"budgets":{"name":"Budgets"},"clouddirectory":{"name":"CloudDirectory","versions":["2016-05-10*"]},"cloudformation":{"name":"CloudFormation","cors":true},"cloudfront":{"name":"CloudFront","versions":["2013-05-12*","2013-11-11*","2014-05-31*","2014-10-21*","2014-11-06*","2015-04-17*","2015-07-27*","2015-09-17*","2016-01-13*","2016-01-28*","2016-08-01*","2016-08-20*","2016-09-07*","2016-09-29*","2016-11-25*","2017-03-25*","2017-10-30*","2018-06-18*","2018-11-05*","2019-03-26*"],"cors":true},"cloudhsm":{"name":"CloudHSM","cors":true},"cloudsearch":{"name":"CloudSearch"},"cloudsearchdomain":{"name":"CloudSearchDomain"},"cloudtrail":{"name":"CloudTrail","cors":true},"cloudwatch":{"prefix":"monitoring","name":"CloudWatch","cors":true},"cloudwatchevents":{"prefix":"events","name":"CloudWatchEvents","versions":["2014-02-03*"],"cors":true},"cloudwatchlogs":{"prefix":"logs","name":"CloudWatchLogs","cors":true},"codebuild":{"name":"CodeBuild","cors":true},"codecommit":{"name":"CodeCommit","cors":true},"codedeploy":{"name":"CodeDeploy","cors":true},"codepipeline":{"name":"CodePipeline","cors":true},"cognitoidentity":{"prefix":"cognito-identity","name":"CognitoIdentity","cors":true},"cognitoidentityserviceprovider":{"prefix":"cognito-idp","name":"CognitoIdentityServiceProvider","cors":true},"cognitosync":{"prefix":"cognito-sync","name":"CognitoSync","cors":true},"configservice":{"prefix":"config","name":"ConfigService","cors":true},"cur":{"name":"CUR","cors":true},"datapipeline":{"name":"DataPipeline"},"devicefarm":{"name":"DeviceFarm","cors":true},"directconnect":{"name":"DirectConnect","cors":true},"directoryservice":{"prefix":"ds","name":"DirectoryService"},"discovery":{"name":"Discovery"},"dms":{"name":"DMS"},"dynamodb":{"name":"DynamoDB","cors":true},"dynamodbstreams":{"prefix":"streams.dynamodb","name":"DynamoDBStreams","cors":true},"ec2":{"name":"EC2","versions":["2013-06-15*","2013-10-15*","2014-02-01*","2014-05-01*","2014-06-15*","2014-09-01*","2014-10-01*","2015-03-01*","2015-04-15*","2015-10-01*","2016-04-01*","2016-09-15*"],"cors":true},"ecr":{"name":"ECR","cors":true},"ecs":{"name":"ECS","cors":true},"efs":{"prefix":"elasticfilesystem","name":"EFS","cors":true},"elasticache":{"name":"ElastiCache","versions":["2012-11-15*","2014-03-24*","2014-07-15*","2014-09-30*"],"cors":true},"elasticbeanstalk":{"name":"ElasticBeanstalk","cors":true},"elb":{"prefix":"elasticloadbalancing","name":"ELB","cors":true},"elbv2":{"prefix":"elasticloadbalancingv2","name":"ELBv2","cors":true},"emr":{"prefix":"elasticmapreduce","name":"EMR","cors":true},"es":{"name":"ES"},"elastictranscoder":{"name":"ElasticTranscoder","cors":true},"firehose":{"name":"Firehose","cors":true},"gamelift":{"name":"GameLift","cors":true},"glacier":{"name":"Glacier"},"health":{"name":"Health"},"iam":{"name":"IAM","cors":true},"importexport":{"name":"ImportExport"},"inspector":{"name":"Inspector","versions":["2015-08-18*"],"cors":true},"iot":{"name":"Iot","cors":true},"iotdata":{"prefix":"iot-data","name":"IotData","cors":true},"kinesis":{"name":"Kinesis","cors":true},"kinesisanalytics":{"name":"KinesisAnalytics"},"kms":{"name":"KMS","cors":true},"lambda":{"name":"Lambda","cors":true},"lexruntime":{"prefix":"runtime.lex","name":"LexRuntime","cors":true},"lightsail":{"name":"Lightsail"},"machinelearning":{"name":"MachineLearning","cors":true},"marketplacecommerceanalytics":{"name":"MarketplaceCommerceAnalytics","cors":true},"marketplacemetering":{"prefix":"meteringmarketplace","name":"MarketplaceMetering"},"mturk":{"prefix":"mturk-requester","name":"MTurk","cors":true},"mobileanalytics":{"name":"MobileAnalytics","cors":true},"opsworks":{"name":"OpsWorks","cors":true},"opsworkscm":{"name":"OpsWorksCM"},"organizations":{"name":"Organizations"},"pinpoint":{"name":"Pinpoint"},"polly":{"name":"Polly","cors":true},"rds":{"name":"RDS","versions":["2014-09-01*"],"cors":true},"redshift":{"name":"Redshift","cors":true},"rekognition":{"name":"Rekognition","cors":true},"resourcegroupstaggingapi":{"name":"ResourceGroupsTaggingAPI"},"route53":{"name":"Route53","cors":true},"route53domains":{"name":"Route53Domains","cors":true},"s3":{"name":"S3","dualstackAvailable":true,"cors":true},"s3control":{"name":"S3Control","dualstackAvailable":true,"xmlNoDefaultLists":true},"servicecatalog":{"name":"ServiceCatalog","cors":true},"ses":{"prefix":"email","name":"SES","cors":true},"shield":{"name":"Shield"},"simpledb":{"prefix":"sdb","name":"SimpleDB"},"sms":{"name":"SMS"},"snowball":{"name":"Snowball"},"sns":{"name":"SNS","cors":true},"sqs":{"name":"SQS","cors":true},"ssm":{"name":"SSM","cors":true},"storagegateway":{"name":"StorageGateway","cors":true},"stepfunctions":{"prefix":"states","name":"StepFunctions"},"sts":{"name":"STS","cors":true},"support":{"name":"Support"},"swf":{"name":"SWF"},"xray":{"name":"XRay","cors":true},"waf":{"name":"WAF","cors":true},"wafregional":{"prefix":"waf-regional","name":"WAFRegional"},"workdocs":{"name":"WorkDocs","cors":true},"workspaces":{"name":"WorkSpaces"},"codestar":{"name":"CodeStar"},"lexmodelbuildingservice":{"prefix":"lex-models","name":"LexModelBuildingService","cors":true},"marketplaceentitlementservice":{"prefix":"entitlement.marketplace","name":"MarketplaceEntitlementService"},"athena":{"name":"Athena"},"greengrass":{"name":"Greengrass"},"dax":{"name":"DAX"},"migrationhub":{"prefix":"AWSMigrationHub","name":"MigrationHub"},"cloudhsmv2":{"name":"CloudHSMV2"},"glue":{"name":"Glue"},"mobile":{"name":"Mobile"},"pricing":{"name":"Pricing","cors":true},"costexplorer":{"prefix":"ce","name":"CostExplorer","cors":true},"mediaconvert":{"name":"MediaConvert"},"medialive":{"name":"MediaLive"},"mediapackage":{"name":"MediaPackage"},"mediastore":{"name":"MediaStore"},"mediastoredata":{"prefix":"mediastore-data","name":"MediaStoreData","cors":true},"appsync":{"name":"AppSync"},"guardduty":{"name":"GuardDuty"},"mq":{"name":"MQ"},"comprehend":{"name":"Comprehend","cors":true},"iotjobsdataplane":{"prefix":"iot-jobs-data","name":"IoTJobsDataPlane"},"kinesisvideoarchivedmedia":{"prefix":"kinesis-video-archived-media","name":"KinesisVideoArchivedMedia","cors":true},"kinesisvideomedia":{"prefix":"kinesis-video-media","name":"KinesisVideoMedia","cors":true},"kinesisvideo":{"name":"KinesisVideo","cors":true},"sagemakerruntime":{"prefix":"runtime.sagemaker","name":"SageMakerRuntime"},"sagemaker":{"name":"SageMaker"},"translate":{"name":"Translate","cors":true},"resourcegroups":{"prefix":"resource-groups","name":"ResourceGroups","cors":true},"alexaforbusiness":{"name":"AlexaForBusiness"},"cloud9":{"name":"Cloud9"},"serverlessapplicationrepository":{"prefix":"serverlessrepo","name":"ServerlessApplicationRepository"},"servicediscovery":{"name":"ServiceDiscovery"},"workmail":{"name":"WorkMail"},"autoscalingplans":{"prefix":"autoscaling-plans","name":"AutoScalingPlans"},"transcribeservice":{"prefix":"transcribe","name":"TranscribeService"},"connect":{"name":"Connect","cors":true},"acmpca":{"prefix":"acm-pca","name":"ACMPCA"},"fms":{"name":"FMS"},"secretsmanager":{"name":"SecretsManager","cors":true},"iotanalytics":{"name":"IoTAnalytics","cors":true},"iot1clickdevicesservice":{"prefix":"iot1click-devices","name":"IoT1ClickDevicesService"},"iot1clickprojects":{"prefix":"iot1click-projects","name":"IoT1ClickProjects"},"pi":{"name":"PI"},"neptune":{"name":"Neptune"},"mediatailor":{"name":"MediaTailor"},"eks":{"name":"EKS"},"macie":{"name":"Macie"},"dlm":{"name":"DLM"},"signer":{"name":"Signer"},"chime":{"name":"Chime"},"pinpointemail":{"prefix":"pinpoint-email","name":"PinpointEmail"},"ram":{"name":"RAM"},"route53resolver":{"name":"Route53Resolver"},"pinpointsmsvoice":{"prefix":"sms-voice","name":"PinpointSMSVoice"},"quicksight":{"name":"QuickSight"},"rdsdataservice":{"prefix":"rds-data","name":"RDSDataService"},"amplify":{"name":"Amplify"},"datasync":{"name":"DataSync"},"robomaker":{"name":"RoboMaker"},"transfer":{"name":"Transfer"},"globalaccelerator":{"name":"GlobalAccelerator"},"comprehendmedical":{"name":"ComprehendMedical","cors":true},"kinesisanalyticsv2":{"name":"KinesisAnalyticsV2"},"mediaconnect":{"name":"MediaConnect"},"fsx":{"name":"FSx"},"securityhub":{"name":"SecurityHub"},"appmesh":{"name":"AppMesh","versions":["2018-10-01*"]},"licensemanager":{"prefix":"license-manager","name":"LicenseManager"},"kafka":{"name":"Kafka"},"apigatewaymanagementapi":{"name":"ApiGatewayManagementApi"},"apigatewayv2":{"name":"ApiGatewayV2"},"docdb":{"name":"DocDB"},"backup":{"name":"Backup"},"worklink":{"name":"WorkLink"},"textract":{"name":"Textract"},"managedblockchain":{"name":"ManagedBlockchain"},"mediapackagevod":{"prefix":"mediapackage-vod","name":"MediaPackageVod"},"groundstation":{"name":"GroundStation"},"iotthingsgraph":{"name":"IoTThingsGraph"},"iotevents":{"name":"IoTEvents"},"ioteventsdata":{"prefix":"iotevents-data","name":"IoTEventsData"},"personalize":{"name":"Personalize","cors":true},"personalizeevents":{"prefix":"personalize-events","name":"PersonalizeEvents","cors":true},"personalizeruntime":{"prefix":"personalize-runtime","name":"PersonalizeRuntime","cors":true},"applicationinsights":{"prefix":"application-insights","name":"ApplicationInsights"},"servicequotas":{"prefix":"service-quotas","name":"ServiceQuotas"},"ec2instanceconnect":{"prefix":"ec2-instance-connect","name":"EC2InstanceConnect"},"eventbridge":{"name":"EventBridge"},"lakeformation":{"name":"LakeFormation"},"forecastservice":{"prefix":"forecast","name":"ForecastService","cors":true},"forecastqueryservice":{"prefix":"forecastquery","name":"ForecastQueryService","cors":true},"qldb":{"name":"QLDB"},"qldbsession":{"prefix":"qldb-session","name":"QLDBSession"},"workmailmessageflow":{"name":"WorkMailMessageFlow"},"codestarnotifications":{"prefix":"codestar-notifications","name":"CodeStarNotifications"},"savingsplans":{"name":"SavingsPlans"},"sso":{"name":"SSO"},"ssooidc":{"prefix":"sso-oidc","name":"SSOOIDC"},"marketplacecatalog":{"prefix":"marketplace-catalog","name":"MarketplaceCatalog"},"dataexchange":{"name":"DataExchange"},"sesv2":{"name":"SESV2"},"migrationhubconfig":{"prefix":"migrationhub-config","name":"MigrationHubConfig"},"connectparticipant":{"name":"ConnectParticipant"},"appconfig":{"name":"AppConfig"},"iotsecuretunneling":{"name":"IoTSecureTunneling"},"wafv2":{"name":"WAFV2"},"elasticinference":{"prefix":"elastic-inference","name":"ElasticInference"},"imagebuilder":{"name":"Imagebuilder"},"schemas":{"name":"Schemas"},"accessanalyzer":{"name":"AccessAnalyzer"},"codegurureviewer":{"prefix":"codeguru-reviewer","name":"CodeGuruReviewer"},"codeguruprofiler":{"name":"CodeGuruProfiler"},"computeoptimizer":{"prefix":"compute-optimizer","name":"ComputeOptimizer"},"frauddetector":{"name":"FraudDetector"},"kendra":{"name":"Kendra"},"networkmanager":{"name":"NetworkManager"},"outposts":{"name":"Outposts"},"augmentedairuntime":{"prefix":"sagemaker-a2i-runtime","name":"AugmentedAIRuntime"},"ebs":{"name":"EBS"},"kinesisvideosignalingchannels":{"prefix":"kinesis-video-signaling","name":"KinesisVideoSignalingChannels","cors":true},"detective":{"name":"Detective"},"codestarconnections":{"prefix":"codestar-connections","name":"CodeStarconnections"},"synthetics":{"name":"Synthetics"},"iotsitewise":{"name":"IoTSiteWise"},"macie2":{"name":"Macie2"},"codeartifact":{"name":"CodeArtifact"},"honeycode":{"name":"Honeycode"},"ivs":{"name":"IVS"}};
+module.exports = {"acm":{"name":"ACM","cors":true},"apigateway":{"name":"APIGateway","cors":true},"applicationautoscaling":{"prefix":"application-autoscaling","name":"ApplicationAutoScaling","cors":true},"appstream":{"name":"AppStream"},"autoscaling":{"name":"AutoScaling","cors":true},"batch":{"name":"Batch"},"budgets":{"name":"Budgets"},"clouddirectory":{"name":"CloudDirectory","versions":["2016-05-10*"]},"cloudformation":{"name":"CloudFormation","cors":true},"cloudfront":{"name":"CloudFront","versions":["2013-05-12*","2013-11-11*","2014-05-31*","2014-10-21*","2014-11-06*","2015-04-17*","2015-07-27*","2015-09-17*","2016-01-13*","2016-01-28*","2016-08-01*","2016-08-20*","2016-09-07*","2016-09-29*","2016-11-25*","2017-03-25*","2017-10-30*","2018-06-18*","2018-11-05*","2019-03-26*"],"cors":true},"cloudhsm":{"name":"CloudHSM","cors":true},"cloudsearch":{"name":"CloudSearch"},"cloudsearchdomain":{"name":"CloudSearchDomain"},"cloudtrail":{"name":"CloudTrail","cors":true},"cloudwatch":{"prefix":"monitoring","name":"CloudWatch","cors":true},"cloudwatchevents":{"prefix":"events","name":"CloudWatchEvents","versions":["2014-02-03*"],"cors":true},"cloudwatchlogs":{"prefix":"logs","name":"CloudWatchLogs","cors":true},"codebuild":{"name":"CodeBuild","cors":true},"codecommit":{"name":"CodeCommit","cors":true},"codedeploy":{"name":"CodeDeploy","cors":true},"codepipeline":{"name":"CodePipeline","cors":true},"cognitoidentity":{"prefix":"cognito-identity","name":"CognitoIdentity","cors":true},"cognitoidentityserviceprovider":{"prefix":"cognito-idp","name":"CognitoIdentityServiceProvider","cors":true},"cognitosync":{"prefix":"cognito-sync","name":"CognitoSync","cors":true},"configservice":{"prefix":"config","name":"ConfigService","cors":true},"cur":{"name":"CUR","cors":true},"datapipeline":{"name":"DataPipeline"},"devicefarm":{"name":"DeviceFarm","cors":true},"directconnect":{"name":"DirectConnect","cors":true},"directoryservice":{"prefix":"ds","name":"DirectoryService"},"discovery":{"name":"Discovery"},"dms":{"name":"DMS"},"dynamodb":{"name":"DynamoDB","cors":true},"dynamodbstreams":{"prefix":"streams.dynamodb","name":"DynamoDBStreams","cors":true},"ec2":{"name":"EC2","versions":["2013-06-15*","2013-10-15*","2014-02-01*","2014-05-01*","2014-06-15*","2014-09-01*","2014-10-01*","2015-03-01*","2015-04-15*","2015-10-01*","2016-04-01*","2016-09-15*"],"cors":true},"ecr":{"name":"ECR","cors":true},"ecs":{"name":"ECS","cors":true},"efs":{"prefix":"elasticfilesystem","name":"EFS","cors":true},"elasticache":{"name":"ElastiCache","versions":["2012-11-15*","2014-03-24*","2014-07-15*","2014-09-30*"],"cors":true},"elasticbeanstalk":{"name":"ElasticBeanstalk","cors":true},"elb":{"prefix":"elasticloadbalancing","name":"ELB","cors":true},"elbv2":{"prefix":"elasticloadbalancingv2","name":"ELBv2","cors":true},"emr":{"prefix":"elasticmapreduce","name":"EMR","cors":true},"es":{"name":"ES"},"elastictranscoder":{"name":"ElasticTranscoder","cors":true},"firehose":{"name":"Firehose","cors":true},"gamelift":{"name":"GameLift","cors":true},"glacier":{"name":"Glacier"},"health":{"name":"Health"},"iam":{"name":"IAM","cors":true},"importexport":{"name":"ImportExport"},"inspector":{"name":"Inspector","versions":["2015-08-18*"],"cors":true},"iot":{"name":"Iot","cors":true},"iotdata":{"prefix":"iot-data","name":"IotData","cors":true},"kinesis":{"name":"Kinesis","cors":true},"kinesisanalytics":{"name":"KinesisAnalytics"},"kms":{"name":"KMS","cors":true},"lambda":{"name":"Lambda","cors":true},"lexruntime":{"prefix":"runtime.lex","name":"LexRuntime","cors":true},"lightsail":{"name":"Lightsail"},"machinelearning":{"name":"MachineLearning","cors":true},"marketplacecommerceanalytics":{"name":"MarketplaceCommerceAnalytics","cors":true},"marketplacemetering":{"prefix":"meteringmarketplace","name":"MarketplaceMetering"},"mturk":{"prefix":"mturk-requester","name":"MTurk","cors":true},"mobileanalytics":{"name":"MobileAnalytics","cors":true},"opsworks":{"name":"OpsWorks","cors":true},"opsworkscm":{"name":"OpsWorksCM"},"organizations":{"name":"Organizations"},"pinpoint":{"name":"Pinpoint"},"polly":{"name":"Polly","cors":true},"rds":{"name":"RDS","versions":["2014-09-01*"],"cors":true},"redshift":{"name":"Redshift","cors":true},"rekognition":{"name":"Rekognition","cors":true},"resourcegroupstaggingapi":{"name":"ResourceGroupsTaggingAPI"},"route53":{"name":"Route53","cors":true},"route53domains":{"name":"Route53Domains","cors":true},"s3":{"name":"S3","dualstackAvailable":true,"cors":true},"s3control":{"name":"S3Control","dualstackAvailable":true,"xmlNoDefaultLists":true},"servicecatalog":{"name":"ServiceCatalog","cors":true},"ses":{"prefix":"email","name":"SES","cors":true},"shield":{"name":"Shield"},"simpledb":{"prefix":"sdb","name":"SimpleDB"},"sms":{"name":"SMS"},"snowball":{"name":"Snowball"},"sns":{"name":"SNS","cors":true},"sqs":{"name":"SQS","cors":true},"ssm":{"name":"SSM","cors":true},"storagegateway":{"name":"StorageGateway","cors":true},"stepfunctions":{"prefix":"states","name":"StepFunctions"},"sts":{"name":"STS","cors":true},"support":{"name":"Support"},"swf":{"name":"SWF"},"xray":{"name":"XRay","cors":true},"waf":{"name":"WAF","cors":true},"wafregional":{"prefix":"waf-regional","name":"WAFRegional"},"workdocs":{"name":"WorkDocs","cors":true},"workspaces":{"name":"WorkSpaces"},"codestar":{"name":"CodeStar"},"lexmodelbuildingservice":{"prefix":"lex-models","name":"LexModelBuildingService","cors":true},"marketplaceentitlementservice":{"prefix":"entitlement.marketplace","name":"MarketplaceEntitlementService"},"athena":{"name":"Athena","cors":true},"greengrass":{"name":"Greengrass"},"dax":{"name":"DAX"},"migrationhub":{"prefix":"AWSMigrationHub","name":"MigrationHub"},"cloudhsmv2":{"name":"CloudHSMV2","cors":true},"glue":{"name":"Glue"},"mobile":{"name":"Mobile"},"pricing":{"name":"Pricing","cors":true},"costexplorer":{"prefix":"ce","name":"CostExplorer","cors":true},"mediaconvert":{"name":"MediaConvert"},"medialive":{"name":"MediaLive"},"mediapackage":{"name":"MediaPackage"},"mediastore":{"name":"MediaStore"},"mediastoredata":{"prefix":"mediastore-data","name":"MediaStoreData","cors":true},"appsync":{"name":"AppSync"},"guardduty":{"name":"GuardDuty"},"mq":{"name":"MQ"},"comprehend":{"name":"Comprehend","cors":true},"iotjobsdataplane":{"prefix":"iot-jobs-data","name":"IoTJobsDataPlane"},"kinesisvideoarchivedmedia":{"prefix":"kinesis-video-archived-media","name":"KinesisVideoArchivedMedia","cors":true},"kinesisvideomedia":{"prefix":"kinesis-video-media","name":"KinesisVideoMedia","cors":true},"kinesisvideo":{"name":"KinesisVideo","cors":true},"sagemakerruntime":{"prefix":"runtime.sagemaker","name":"SageMakerRuntime"},"sagemaker":{"name":"SageMaker"},"translate":{"name":"Translate","cors":true},"resourcegroups":{"prefix":"resource-groups","name":"ResourceGroups","cors":true},"alexaforbusiness":{"name":"AlexaForBusiness"},"cloud9":{"name":"Cloud9"},"serverlessapplicationrepository":{"prefix":"serverlessrepo","name":"ServerlessApplicationRepository"},"servicediscovery":{"name":"ServiceDiscovery"},"workmail":{"name":"WorkMail"},"autoscalingplans":{"prefix":"autoscaling-plans","name":"AutoScalingPlans"},"transcribeservice":{"prefix":"transcribe","name":"TranscribeService"},"connect":{"name":"Connect","cors":true},"acmpca":{"prefix":"acm-pca","name":"ACMPCA"},"fms":{"name":"FMS"},"secretsmanager":{"name":"SecretsManager","cors":true},"iotanalytics":{"name":"IoTAnalytics","cors":true},"iot1clickdevicesservice":{"prefix":"iot1click-devices","name":"IoT1ClickDevicesService"},"iot1clickprojects":{"prefix":"iot1click-projects","name":"IoT1ClickProjects"},"pi":{"name":"PI"},"neptune":{"name":"Neptune"},"mediatailor":{"name":"MediaTailor"},"eks":{"name":"EKS"},"macie":{"name":"Macie"},"dlm":{"name":"DLM"},"signer":{"name":"Signer"},"chime":{"name":"Chime"},"pinpointemail":{"prefix":"pinpoint-email","name":"PinpointEmail"},"ram":{"name":"RAM"},"route53resolver":{"name":"Route53Resolver"},"pinpointsmsvoice":{"prefix":"sms-voice","name":"PinpointSMSVoice"},"quicksight":{"name":"QuickSight"},"rdsdataservice":{"prefix":"rds-data","name":"RDSDataService"},"amplify":{"name":"Amplify"},"datasync":{"name":"DataSync"},"robomaker":{"name":"RoboMaker"},"transfer":{"name":"Transfer"},"globalaccelerator":{"name":"GlobalAccelerator"},"comprehendmedical":{"name":"ComprehendMedical","cors":true},"kinesisanalyticsv2":{"name":"KinesisAnalyticsV2"},"mediaconnect":{"name":"MediaConnect"},"fsx":{"name":"FSx"},"securityhub":{"name":"SecurityHub"},"appmesh":{"name":"AppMesh","versions":["2018-10-01*"]},"licensemanager":{"prefix":"license-manager","name":"LicenseManager"},"kafka":{"name":"Kafka"},"apigatewaymanagementapi":{"name":"ApiGatewayManagementApi"},"apigatewayv2":{"name":"ApiGatewayV2"},"docdb":{"name":"DocDB"},"backup":{"name":"Backup"},"worklink":{"name":"WorkLink"},"textract":{"name":"Textract"},"managedblockchain":{"name":"ManagedBlockchain"},"mediapackagevod":{"prefix":"mediapackage-vod","name":"MediaPackageVod"},"groundstation":{"name":"GroundStation"},"iotthingsgraph":{"name":"IoTThingsGraph"},"iotevents":{"name":"IoTEvents"},"ioteventsdata":{"prefix":"iotevents-data","name":"IoTEventsData"},"personalize":{"name":"Personalize","cors":true},"personalizeevents":{"prefix":"personalize-events","name":"PersonalizeEvents","cors":true},"personalizeruntime":{"prefix":"personalize-runtime","name":"PersonalizeRuntime","cors":true},"applicationinsights":{"prefix":"application-insights","name":"ApplicationInsights"},"servicequotas":{"prefix":"service-quotas","name":"ServiceQuotas"},"ec2instanceconnect":{"prefix":"ec2-instance-connect","name":"EC2InstanceConnect"},"eventbridge":{"name":"EventBridge"},"lakeformation":{"name":"LakeFormation"},"forecastservice":{"prefix":"forecast","name":"ForecastService","cors":true},"forecastqueryservice":{"prefix":"forecastquery","name":"ForecastQueryService","cors":true},"qldb":{"name":"QLDB"},"qldbsession":{"prefix":"qldb-session","name":"QLDBSession"},"workmailmessageflow":{"name":"WorkMailMessageFlow"},"codestarnotifications":{"prefix":"codestar-notifications","name":"CodeStarNotifications"},"savingsplans":{"name":"SavingsPlans"},"sso":{"name":"SSO"},"ssooidc":{"prefix":"sso-oidc","name":"SSOOIDC"},"marketplacecatalog":{"prefix":"marketplace-catalog","name":"MarketplaceCatalog","cors":true},"dataexchange":{"name":"DataExchange"},"sesv2":{"name":"SESV2"},"migrationhubconfig":{"prefix":"migrationhub-config","name":"MigrationHubConfig"},"connectparticipant":{"name":"ConnectParticipant"},"appconfig":{"name":"AppConfig"},"iotsecuretunneling":{"name":"IoTSecureTunneling"},"wafv2":{"name":"WAFV2"},"elasticinference":{"prefix":"elastic-inference","name":"ElasticInference"},"imagebuilder":{"name":"Imagebuilder"},"schemas":{"name":"Schemas"},"accessanalyzer":{"name":"AccessAnalyzer"},"codegurureviewer":{"prefix":"codeguru-reviewer","name":"CodeGuruReviewer"},"codeguruprofiler":{"name":"CodeGuruProfiler"},"computeoptimizer":{"prefix":"compute-optimizer","name":"ComputeOptimizer"},"frauddetector":{"name":"FraudDetector"},"kendra":{"name":"Kendra"},"networkmanager":{"name":"NetworkManager"},"outposts":{"name":"Outposts"},"augmentedairuntime":{"prefix":"sagemaker-a2i-runtime","name":"AugmentedAIRuntime"},"ebs":{"name":"EBS"},"kinesisvideosignalingchannels":{"prefix":"kinesis-video-signaling","name":"KinesisVideoSignalingChannels","cors":true},"detective":{"name":"Detective"},"codestarconnections":{"prefix":"codestar-connections","name":"CodeStarconnections"},"synthetics":{"name":"Synthetics"},"iotsitewise":{"name":"IoTSiteWise"},"macie2":{"name":"Macie2"},"codeartifact":{"name":"CodeArtifact"},"honeycode":{"name":"Honeycode"},"ivs":{"name":"IVS"},"braket":{"name":"Braket"},"identitystore":{"name":"IdentityStore"},"appflow":{"name":"Appflow"},"redshiftdata":{"prefix":"redshift-data","name":"RedshiftData"},"ssoadmin":{"prefix":"sso-admin","name":"SSOAdmin"},"timestreamquery":{"prefix":"timestream-query","name":"TimestreamQuery"},"timestreamwrite":{"prefix":"timestream-write","name":"TimestreamWrite"},"s3outposts":{"name":"S3Outposts"},"databrew":{"name":"DataBrew"},"servicecatalogappregistry":{"prefix":"servicecatalog-appregistry","name":"ServiceCatalogAppRegistry"},"networkfirewall":{"prefix":"network-firewall","name":"NetworkFirewall"},"mwaa":{"name":"MWAA"},"amplifybackend":{"name":"AmplifyBackend"},"appintegrations":{"name":"AppIntegrations"},"connectcontactlens":{"prefix":"connect-contact-lens","name":"ConnectContactLens"},"devopsguru":{"prefix":"devops-guru","name":"DevOpsGuru"},"ecrpublic":{"prefix":"ecr-public","name":"ECRPUBLIC"},"lookoutvision":{"name":"LookoutVision"},"sagemakerfeaturestoreruntime":{"prefix":"sagemaker-featurestore-runtime","name":"SageMakerFeatureStoreRuntime"},"customerprofiles":{"prefix":"customer-profiles","name":"CustomerProfiles"},"auditmanager":{"name":"AuditManager"},"emrcontainers":{"prefix":"emr-containers","name":"EMRcontainers"},"healthlake":{"name":"HealthLake"},"sagemakeredge":{"prefix":"sagemaker-edge","name":"SagemakerEdge"},"amp":{"name":"Amp"},"greengrassv2":{"name":"GreengrassV2"},"iotdeviceadvisor":{"name":"IotDeviceAdvisor"},"iotfleethub":{"name":"IoTFleetHub"},"iotwireless":{"name":"IoTWireless"},"location":{"name":"Location","cors":true},"wellarchitected":{"name":"WellArchitected"},"lexmodelsv2":{"prefix":"models.lex.v2","name":"LexModelsV2"},"lexruntimev2":{"prefix":"runtime.lex.v2","name":"LexRuntimeV2","cors":true},"fis":{"name":"Fis"},"lookoutmetrics":{"name":"LookoutMetrics"},"mgn":{"name":"Mgn"},"lookoutequipment":{"name":"LookoutEquipment"},"nimble":{"name":"Nimble"},"finspace":{"name":"Finspace"},"finspacedata":{"prefix":"finspace-data","name":"Finspacedata"},"ssmcontacts":{"prefix":"ssm-contacts","name":"SSMContacts"},"ssmincidents":{"prefix":"ssm-incidents","name":"SSMIncidents"},"applicationcostprofiler":{"name":"ApplicationCostProfiler"},"apprunner":{"name":"AppRunner"},"proton":{"name":"Proton"},"route53recoverycluster":{"prefix":"route53-recovery-cluster","name":"Route53RecoveryCluster"},"route53recoverycontrolconfig":{"prefix":"route53-recovery-control-config","name":"Route53RecoveryControlConfig"},"route53recoveryreadiness":{"prefix":"route53-recovery-readiness","name":"Route53RecoveryReadiness"},"chimesdkidentity":{"prefix":"chime-sdk-identity","name":"ChimeSDKIdentity"},"chimesdkmessaging":{"prefix":"chime-sdk-messaging","name":"ChimeSDKMessaging"},"snowdevicemanagement":{"prefix":"snow-device-management","name":"SnowDeviceManagement"},"memorydb":{"name":"MemoryDB"},"opensearch":{"name":"OpenSearch"},"kafkaconnect":{"name":"KafkaConnect"},"voiceid":{"prefix":"voice-id","name":"VoiceID"},"wisdom":{"name":"Wisdom"},"account":{"name":"Account"},"cloudcontrol":{"name":"CloudControl"},"grafana":{"name":"Grafana"},"panorama":{"name":"Panorama"},"chimesdkmeetings":{"prefix":"chime-sdk-meetings","name":"ChimeSDKMeetings"},"resiliencehub":{"name":"Resiliencehub"},"migrationhubstrategy":{"name":"MigrationHubStrategy"},"appconfigdata":{"name":"AppConfigData"},"drs":{"name":"Drs"},"migrationhubrefactorspaces":{"prefix":"migration-hub-refactor-spaces","name":"MigrationHubRefactorSpaces"},"evidently":{"name":"Evidently"},"inspector2":{"name":"Inspector2"},"rbin":{"name":"Rbin"},"rum":{"name":"RUM"},"backupgateway":{"prefix":"backup-gateway","name":"BackupGateway"},"iottwinmaker":{"name":"IoTTwinMaker"},"workspacesweb":{"prefix":"workspaces-web","name":"WorkSpacesWeb"},"amplifyuibuilder":{"name":"AmplifyUIBuilder"},"keyspaces":{"name":"Keyspaces"},"billingconductor":{"name":"Billingconductor"},"gamesparks":{"name":"GameSparks"},"pinpointsmsvoicev2":{"prefix":"pinpoint-sms-voice-v2","name":"PinpointSMSVoiceV2"},"ivschat":{"name":"Ivschat"},"chimesdkmediapipelines":{"prefix":"chime-sdk-media-pipelines","name":"ChimeSDKMediaPipelines"},"emrserverless":{"prefix":"emr-serverless","name":"EMRServerless"},"m2":{"name":"M2"},"connectcampaigns":{"name":"ConnectCampaigns"},"redshiftserverless":{"prefix":"redshift-serverless","name":"RedshiftServerless"},"rolesanywhere":{"name":"RolesAnywhere"},"licensemanagerusersubscriptions":{"prefix":"license-manager-user-subscriptions","name":"LicenseManagerUserSubscriptions"},"backupstorage":{"name":"BackupStorage"},"privatenetworks":{"name":"PrivateNetworks"},"supportapp":{"prefix":"support-app","name":"SupportApp"},"controltower":{"name":"ControlTower"},"iotfleetwise":{"name":"IoTFleetWise"},"migrationhuborchestrator":{"name":"MigrationHubOrchestrator"},"connectcases":{"name":"ConnectCases"},"resourceexplorer2":{"prefix":"resource-explorer-2","name":"ResourceExplorer2"},"scheduler":{"name":"Scheduler"},"chimesdkvoice":{"prefix":"chime-sdk-voice","name":"ChimeSDKVoice"},"iotroborunner":{"prefix":"iot-roborunner","name":"IoTRoboRunner"},"ssmsap":{"prefix":"ssm-sap","name":"SsmSap"},"oam":{"name":"OAM"},"arczonalshift":{"prefix":"arc-zonal-shift","name":"ARCZonalShift"},"omics":{"name":"Omics"},"opensearchserverless":{"name":"OpenSearchServerless"},"securitylake":{"name":"SecurityLake"},"simspaceweaver":{"name":"SimSpaceWeaver"},"docdbelastic":{"prefix":"docdb-elastic","name":"DocDBElastic"},"sagemakergeospatial":{"prefix":"sagemaker-geospatial","name":"SageMakerGeospatial"},"codecatalyst":{"name":"CodeCatalyst"},"pipes":{"name":"Pipes"}};
 
 /***/ }),
 /* 695 */,
@@ -17518,7 +20878,7 @@ AWS.HttpClient.getInstance = function getInstance() {
 /* 715 */
 /***/ (function(module) {
 
-module.exports = {"version":"2.0","metadata":{"apiVersion":"2011-06-15","endpointPrefix":"sts","globalEndpoint":"sts.amazonaws.com","protocol":"query","serviceAbbreviation":"AWS STS","serviceFullName":"AWS Security Token Service","serviceId":"STS","signatureVersion":"v4","uid":"sts-2011-06-15","xmlNamespace":"https://sts.amazonaws.com/doc/2011-06-15/"},"operations":{"AssumeRole":{"input":{"type":"structure","required":["RoleArn","RoleSessionName"],"members":{"RoleArn":{},"RoleSessionName":{},"PolicyArns":{"shape":"S4"},"Policy":{},"DurationSeconds":{"type":"integer"},"Tags":{"shape":"S8"},"TransitiveTagKeys":{"type":"list","member":{}},"ExternalId":{},"SerialNumber":{},"TokenCode":{}}},"output":{"resultWrapper":"AssumeRoleResult","type":"structure","members":{"Credentials":{"shape":"Sh"},"AssumedRoleUser":{"shape":"Sm"},"PackedPolicySize":{"type":"integer"}}}},"AssumeRoleWithSAML":{"input":{"type":"structure","required":["RoleArn","PrincipalArn","SAMLAssertion"],"members":{"RoleArn":{},"PrincipalArn":{},"SAMLAssertion":{"type":"string","sensitive":true},"PolicyArns":{"shape":"S4"},"Policy":{},"DurationSeconds":{"type":"integer"}}},"output":{"resultWrapper":"AssumeRoleWithSAMLResult","type":"structure","members":{"Credentials":{"shape":"Sh"},"AssumedRoleUser":{"shape":"Sm"},"PackedPolicySize":{"type":"integer"},"Subject":{},"SubjectType":{},"Issuer":{},"Audience":{},"NameQualifier":{}}}},"AssumeRoleWithWebIdentity":{"input":{"type":"structure","required":["RoleArn","RoleSessionName","WebIdentityToken"],"members":{"RoleArn":{},"RoleSessionName":{},"WebIdentityToken":{"type":"string","sensitive":true},"ProviderId":{},"PolicyArns":{"shape":"S4"},"Policy":{},"DurationSeconds":{"type":"integer"}}},"output":{"resultWrapper":"AssumeRoleWithWebIdentityResult","type":"structure","members":{"Credentials":{"shape":"Sh"},"SubjectFromWebIdentityToken":{},"AssumedRoleUser":{"shape":"Sm"},"PackedPolicySize":{"type":"integer"},"Provider":{},"Audience":{}}}},"DecodeAuthorizationMessage":{"input":{"type":"structure","required":["EncodedMessage"],"members":{"EncodedMessage":{}}},"output":{"resultWrapper":"DecodeAuthorizationMessageResult","type":"structure","members":{"DecodedMessage":{}}}},"GetAccessKeyInfo":{"input":{"type":"structure","required":["AccessKeyId"],"members":{"AccessKeyId":{}}},"output":{"resultWrapper":"GetAccessKeyInfoResult","type":"structure","members":{"Account":{}}}},"GetCallerIdentity":{"input":{"type":"structure","members":{}},"output":{"resultWrapper":"GetCallerIdentityResult","type":"structure","members":{"UserId":{},"Account":{},"Arn":{}}}},"GetFederationToken":{"input":{"type":"structure","required":["Name"],"members":{"Name":{},"Policy":{},"PolicyArns":{"shape":"S4"},"DurationSeconds":{"type":"integer"},"Tags":{"shape":"S8"}}},"output":{"resultWrapper":"GetFederationTokenResult","type":"structure","members":{"Credentials":{"shape":"Sh"},"FederatedUser":{"type":"structure","required":["FederatedUserId","Arn"],"members":{"FederatedUserId":{},"Arn":{}}},"PackedPolicySize":{"type":"integer"}}}},"GetSessionToken":{"input":{"type":"structure","members":{"DurationSeconds":{"type":"integer"},"SerialNumber":{},"TokenCode":{}}},"output":{"resultWrapper":"GetSessionTokenResult","type":"structure","members":{"Credentials":{"shape":"Sh"}}}}},"shapes":{"S4":{"type":"list","member":{"type":"structure","members":{"arn":{}}}},"S8":{"type":"list","member":{"type":"structure","required":["Key","Value"],"members":{"Key":{},"Value":{}}}},"Sh":{"type":"structure","required":["AccessKeyId","SecretAccessKey","SessionToken","Expiration"],"members":{"AccessKeyId":{},"SecretAccessKey":{},"SessionToken":{},"Expiration":{"type":"timestamp"}}},"Sm":{"type":"structure","required":["AssumedRoleId","Arn"],"members":{"AssumedRoleId":{},"Arn":{}}}}};
+module.exports = {"version":"2.0","metadata":{"apiVersion":"2011-06-15","endpointPrefix":"sts","globalEndpoint":"sts.amazonaws.com","protocol":"query","serviceAbbreviation":"AWS STS","serviceFullName":"AWS Security Token Service","serviceId":"STS","signatureVersion":"v4","uid":"sts-2011-06-15","xmlNamespace":"https://sts.amazonaws.com/doc/2011-06-15/"},"operations":{"AssumeRole":{"input":{"type":"structure","required":["RoleArn","RoleSessionName"],"members":{"RoleArn":{},"RoleSessionName":{},"PolicyArns":{"shape":"S4"},"Policy":{},"DurationSeconds":{"type":"integer"},"Tags":{"shape":"S8"},"TransitiveTagKeys":{"type":"list","member":{}},"ExternalId":{},"SerialNumber":{},"TokenCode":{},"SourceIdentity":{}}},"output":{"resultWrapper":"AssumeRoleResult","type":"structure","members":{"Credentials":{"shape":"Si"},"AssumedRoleUser":{"shape":"Sn"},"PackedPolicySize":{"type":"integer"},"SourceIdentity":{}}}},"AssumeRoleWithSAML":{"input":{"type":"structure","required":["RoleArn","PrincipalArn","SAMLAssertion"],"members":{"RoleArn":{},"PrincipalArn":{},"SAMLAssertion":{},"PolicyArns":{"shape":"S4"},"Policy":{},"DurationSeconds":{"type":"integer"}}},"output":{"resultWrapper":"AssumeRoleWithSAMLResult","type":"structure","members":{"Credentials":{"shape":"Si"},"AssumedRoleUser":{"shape":"Sn"},"PackedPolicySize":{"type":"integer"},"Subject":{},"SubjectType":{},"Issuer":{},"Audience":{},"NameQualifier":{},"SourceIdentity":{}}}},"AssumeRoleWithWebIdentity":{"input":{"type":"structure","required":["RoleArn","RoleSessionName","WebIdentityToken"],"members":{"RoleArn":{},"RoleSessionName":{},"WebIdentityToken":{},"ProviderId":{},"PolicyArns":{"shape":"S4"},"Policy":{},"DurationSeconds":{"type":"integer"}}},"output":{"resultWrapper":"AssumeRoleWithWebIdentityResult","type":"structure","members":{"Credentials":{"shape":"Si"},"SubjectFromWebIdentityToken":{},"AssumedRoleUser":{"shape":"Sn"},"PackedPolicySize":{"type":"integer"},"Provider":{},"Audience":{},"SourceIdentity":{}}}},"DecodeAuthorizationMessage":{"input":{"type":"structure","required":["EncodedMessage"],"members":{"EncodedMessage":{}}},"output":{"resultWrapper":"DecodeAuthorizationMessageResult","type":"structure","members":{"DecodedMessage":{}}}},"GetAccessKeyInfo":{"input":{"type":"structure","required":["AccessKeyId"],"members":{"AccessKeyId":{}}},"output":{"resultWrapper":"GetAccessKeyInfoResult","type":"structure","members":{"Account":{}}}},"GetCallerIdentity":{"input":{"type":"structure","members":{}},"output":{"resultWrapper":"GetCallerIdentityResult","type":"structure","members":{"UserId":{},"Account":{},"Arn":{}}}},"GetFederationToken":{"input":{"type":"structure","required":["Name"],"members":{"Name":{},"Policy":{},"PolicyArns":{"shape":"S4"},"DurationSeconds":{"type":"integer"},"Tags":{"shape":"S8"}}},"output":{"resultWrapper":"GetFederationTokenResult","type":"structure","members":{"Credentials":{"shape":"Si"},"FederatedUser":{"type":"structure","required":["FederatedUserId","Arn"],"members":{"FederatedUserId":{},"Arn":{}}},"PackedPolicySize":{"type":"integer"}}}},"GetSessionToken":{"input":{"type":"structure","members":{"DurationSeconds":{"type":"integer"},"SerialNumber":{},"TokenCode":{}}},"output":{"resultWrapper":"GetSessionTokenResult","type":"structure","members":{"Credentials":{"shape":"Si"}}}}},"shapes":{"S4":{"type":"list","member":{"type":"structure","members":{"arn":{}}}},"S8":{"type":"list","member":{"type":"structure","required":["Key","Value"],"members":{"Key":{},"Value":{}}}},"Si":{"type":"structure","required":["AccessKeyId","SecretAccessKey","SessionToken","Expiration"],"members":{"AccessKeyId":{},"SecretAccessKey":{},"SessionToken":{},"Expiration":{"type":"timestamp"}}},"Sn":{"type":"structure","required":["AssumedRoleId","Arn"],"members":{"AssumedRoleId":{},"Arn":{}}}}};
 
 /***/ }),
 /* 716 */,
@@ -17592,40 +20952,11 @@ exports.default = SyncReader;
 /* 719 */,
 /* 720 */,
 /* 721 */,
-/* 722 */
-/***/ (function(module) {
-
-/**
- * Convert array of 16 byte values to UUID string format of the form:
- * XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
- */
-var byteToHex = [];
-for (var i = 0; i < 256; ++i) {
-  byteToHex[i] = (i + 0x100).toString(16).substr(1);
-}
-
-function bytesToUuid(buf, offset) {
-  var i = offset || 0;
-  var bth = byteToHex;
-  // join used to fix memory issue caused by concatenation: https://bugs.chromium.org/p/v8/issues/detail?id=3175#c4
-  return ([bth[buf[i++]], bth[buf[i++]], 
-	bth[buf[i++]], bth[buf[i++]], '-',
-	bth[buf[i++]], bth[buf[i++]], '-',
-	bth[buf[i++]], bth[buf[i++]], '-',
-	bth[buf[i++]], bth[buf[i++]], '-',
-	bth[buf[i++]], bth[buf[i++]],
-	bth[buf[i++]], bth[buf[i++]],
-	bth[buf[i++]], bth[buf[i++]]]).join('');
-}
-
-module.exports = bytesToUuid;
-
-
-/***/ }),
+/* 722 */,
 /* 723 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
-var Transform = __webpack_require__(413).Transform;
+var Transform = __webpack_require__(794).Transform;
 var parseEvent = __webpack_require__(657).parseEvent;
 
 /** @type {Transform} */
@@ -17675,7 +21006,7 @@ module.exports = {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.matchAny = exports.convertPatternsToRe = exports.makeRe = exports.getPatternParts = exports.expandBraceExpansion = exports.expandPatternsWithBraceExpansion = exports.isAffectDepthOfReadingPattern = exports.endsWithSlashGlobStar = exports.hasGlobStar = exports.getBaseDirectory = exports.getPositivePatterns = exports.getNegativePatterns = exports.isPositivePattern = exports.isNegativePattern = exports.convertToNegativePattern = exports.convertToPositivePattern = exports.isDynamicPattern = exports.isStaticPattern = void 0;
 const path = __webpack_require__(622);
-const globParent = __webpack_require__(763);
+const globParent = __webpack_require__(230);
 const micromatch = __webpack_require__(74);
 const picomatch = __webpack_require__(827);
 const GLOBSTAR = '**';
@@ -18107,28 +21438,49 @@ module.exports = fill;
 /* 731 */,
 /* 732 */,
 /* 733 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
-__webpack_require__(234);
-var AWS = __webpack_require__(395);
-var Service = AWS.Service;
-var apiLoader = AWS.apiLoader;
+"use strict";
 
-apiLoader.services['sts'] = {};
-AWS.STS = Service.defineService('sts', ['2011-06-15']);
-__webpack_require__(861);
-Object.defineProperty(apiLoader.services['sts'], '2011-06-15', {
-  get: function get() {
-    var model = __webpack_require__(715);
-    model.paginators = __webpack_require__(262).pagination;
-    return model;
-  },
-  enumerable: true,
-  configurable: true
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
 });
+exports.default = void 0;
 
-module.exports = AWS.STS;
+var _rng = _interopRequireDefault(__webpack_require__(844));
 
+var _bytesToUuid = _interopRequireDefault(__webpack_require__(390));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function v4(options, buf, offset) {
+  var i = buf && offset || 0;
+
+  if (typeof options == 'string') {
+    buf = options === 'binary' ? new Array(16) : null;
+    options = null;
+  }
+
+  options = options || {};
+
+  var rnds = options.random || (options.rng || _rng.default)(); // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
+
+
+  rnds[6] = rnds[6] & 0x0f | 0x40;
+  rnds[8] = rnds[8] & 0x3f | 0x80; // Copy bytes to buffer, if provided
+
+  if (buf) {
+    for (var ii = 0; ii < 16; ++ii) {
+      buf[i + ii] = rnds[ii];
+    }
+  }
+
+  return buf || (0, _bytesToUuid.default)(rnds);
+}
+
+var _default = v4;
+exports.default = _default;
 
 /***/ }),
 /* 734 */,
@@ -18296,10 +21648,165 @@ module.exports = AWS.STS;
 /* 739 */,
 /* 740 */,
 /* 741 */,
-/* 742 */,
+/* 742 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+var __awaiter = (this && this.__awaiter) || function (thisArg, _arguments, P, generator) {
+    function adopt(value) { return value instanceof P ? value : new P(function (resolve) { resolve(value); }); }
+    return new (P || (P = Promise))(function (resolve, reject) {
+        function fulfilled(value) { try { step(generator.next(value)); } catch (e) { reject(e); } }
+        function rejected(value) { try { step(generator["throw"](value)); } catch (e) { reject(e); } }
+        function step(result) { result.done ? resolve(result.value) : adopt(result.value).then(fulfilled, rejected); }
+        step((generator = generator.apply(thisArg, _arguments || [])).next());
+    });
+};
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.OidcClient = void 0;
+const http_client_1 = __webpack_require__(425);
+const auth_1 = __webpack_require__(554);
+const core_1 = __webpack_require__(470);
+class OidcClient {
+    static createHttpClient(allowRetry = true, maxRetry = 10) {
+        const requestOptions = {
+            allowRetries: allowRetry,
+            maxRetries: maxRetry
+        };
+        return new http_client_1.HttpClient('actions/oidc-client', [new auth_1.BearerCredentialHandler(OidcClient.getRequestToken())], requestOptions);
+    }
+    static getRequestToken() {
+        const token = process.env['ACTIONS_ID_TOKEN_REQUEST_TOKEN'];
+        if (!token) {
+            throw new Error('Unable to get ACTIONS_ID_TOKEN_REQUEST_TOKEN env variable');
+        }
+        return token;
+    }
+    static getIDTokenUrl() {
+        const runtimeUrl = process.env['ACTIONS_ID_TOKEN_REQUEST_URL'];
+        if (!runtimeUrl) {
+            throw new Error('Unable to get ACTIONS_ID_TOKEN_REQUEST_URL env variable');
+        }
+        return runtimeUrl;
+    }
+    static getCall(id_token_url) {
+        var _a;
+        return __awaiter(this, void 0, void 0, function* () {
+            const httpclient = OidcClient.createHttpClient();
+            const res = yield httpclient
+                .getJson(id_token_url)
+                .catch(error => {
+                throw new Error(`Failed to get ID Token. \n 
+        Error Code : ${error.statusCode}\n 
+        Error Message: ${error.result.message}`);
+            });
+            const id_token = (_a = res.result) === null || _a === void 0 ? void 0 : _a.value;
+            if (!id_token) {
+                throw new Error('Response json body do not have ID Token field');
+            }
+            return id_token;
+        });
+    }
+    static getIDToken(audience) {
+        return __awaiter(this, void 0, void 0, function* () {
+            try {
+                // New ID Token is requested from action service
+                let id_token_url = OidcClient.getIDTokenUrl();
+                if (audience) {
+                    const encodedAudience = encodeURIComponent(audience);
+                    id_token_url = `${id_token_url}&audience=${encodedAudience}`;
+                }
+                core_1.debug(`ID token url is ${id_token_url}`);
+                const id_token = yield OidcClient.getCall(id_token_url);
+                core_1.setSecret(id_token);
+                return id_token;
+            }
+            catch (error) {
+                throw new Error(`Error message: ${error.message}`);
+            }
+        });
+    }
+}
+exports.OidcClient = OidcClient;
+//# sourceMappingURL=oidc-utils.js.map
+
+/***/ }),
 /* 743 */,
 /* 744 */,
-/* 745 */,
+/* 745 */
+/***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
+
+var AWS = __webpack_require__(395);
+
+/**
+ * Represents credentials from a JSON file on disk.
+ * If the credentials expire, the SDK can {refresh} the credentials
+ * from the file.
+ *
+ * The format of the file should be similar to the options passed to
+ * {AWS.Config}:
+ *
+ * ```javascript
+ * {accessKeyId: 'akid', secretAccessKey: 'secret', sessionToken: 'optional'}
+ * ```
+ *
+ * @example Loading credentials from disk
+ *   var creds = new AWS.FileSystemCredentials('./configuration.json');
+ *   creds.accessKeyId == 'AKID'
+ *
+ * @!attribute filename
+ *   @readonly
+ *   @return [String] the path to the JSON file on disk containing the
+ *     credentials.
+ * @!macro nobrowser
+ */
+AWS.FileSystemCredentials = AWS.util.inherit(AWS.Credentials, {
+
+  /**
+   * @overload AWS.FileSystemCredentials(filename)
+   *   Creates a new FileSystemCredentials object from a filename
+   *
+   *   @param filename [String] the path on disk to the JSON file to load.
+   */
+  constructor: function FileSystemCredentials(filename) {
+    AWS.Credentials.call(this);
+    this.filename = filename;
+    this.get(function() {});
+  },
+
+  /**
+   * Loads the credentials from the {filename} on disk.
+   *
+   * @callback callback function(err)
+   *   Called after the JSON file on disk is read and parsed. When this callback
+   *   is called with no error, it means that the credentials information
+   *   has been loaded into the object (as the `accessKeyId`, `secretAccessKey`,
+   *   and `sessionToken` properties).
+   *   @param err [Error] if an error occurred, this value will be filled
+   * @see get
+   */
+  refresh: function refresh(callback) {
+    if (!callback) callback = AWS.util.fn.callback;
+    try {
+      var creds = JSON.parse(AWS.util.readFileSync(this.filename));
+      AWS.Credentials.call(this, creds);
+      if (!this.accessKeyId || !this.secretAccessKey) {
+        throw AWS.util.error(
+          new Error('Credentials not set in ' + this.filename),
+        { code: 'FileSystemCredentialsProviderFailure' }
+        );
+      }
+      this.expired = false;
+      callback();
+    } catch (err) {
+      callback(err);
+    }
+  }
+
+});
+
+
+/***/ }),
 /* 746 */,
 /* 747 */
 /***/ (function(module) {
@@ -18655,6 +22162,8 @@ module.exports = require("fs");
 var AWS = __webpack_require__(395);
 __webpack_require__(711);
 var inherit = AWS.util.inherit;
+var getMetadataServiceEndpoint = __webpack_require__(756);
+var URL = __webpack_require__(414).URL;
 
 /**
  * Represents a metadata service available on EC2 instances. Using the
@@ -18674,9 +22183,9 @@ var inherit = AWS.util.inherit;
  */
 AWS.MetadataService = inherit({
   /**
-   * @return [String] the hostname of the instance metadata service
+   * @return [String] the endpoint of the instance metadata service
    */
-  host: '169.254.169.254',
+  endpoint: getMetadataServiceEndpoint(),
 
   /**
    * @!ignore
@@ -18712,6 +22221,10 @@ AWS.MetadataService = inherit({
    *   retry delay on retryable errors. See AWS.Config for details.
    */
   constructor: function MetadataService(options) {
+    if (options && options.host) {
+      options.endpoint = 'http://' + options.host;
+      delete options.host;
+    }
     AWS.util.update(this, options);
   },
 
@@ -18744,7 +22257,11 @@ AWS.MetadataService = inherit({
     }
 
     path = path || '/';
-    var httpRequest = new AWS.HttpRequest('http://' + this.host + path);
+
+    // Verify that host is a valid URL
+    if (URL) { new URL(this.endpoint); }
+
+    var httpRequest = new AWS.HttpRequest(this.endpoint + path);
     httpRequest.method = options.method || 'GET';
     if (options.headers) {
       httpRequest.headers = options.headers;
@@ -19076,7 +22593,7 @@ AWS.Signers.V4 = inherit(AWS.Signers.RequestSigner, {
 
   hexEncodedBodyHash: function hexEncodedBodyHash() {
     var request = this.request;
-    if (this.isPresigned() && this.serviceName === 's3' && !request.body) {
+    if (this.isPresigned() && (['s3', 's3-object-lambda'].indexOf(this.serviceName) > -1) && !request.body) {
       return 'UNSIGNED-PAYLOAD';
     } else if (request.headers['X-Amz-Content-Sha256']) {
       return request.headers['X-Amz-Content-Sha256'];
@@ -19175,7 +22692,36 @@ module.exports = AWS.Signers.V4;
 
 
 /***/ }),
-/* 756 */,
+/* 756 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+var AWS = __webpack_require__(395);
+
+var Endpoint = __webpack_require__(595)();
+var EndpointMode = __webpack_require__(587)();
+
+var ENDPOINT_CONFIG_OPTIONS = __webpack_require__(160)();
+var ENDPOINT_MODE_CONFIG_OPTIONS = __webpack_require__(273)();
+
+var getMetadataServiceEndpoint = function() {
+  var endpoint = AWS.util.loadConfig(ENDPOINT_CONFIG_OPTIONS);
+  if (endpoint !== undefined) return endpoint;
+
+  var endpointMode = AWS.util.loadConfig(ENDPOINT_MODE_CONFIG_OPTIONS);
+  switch (endpointMode) {
+    case EndpointMode.IPv4:
+      return Endpoint.IPv4;
+    case EndpointMode.IPv6:
+      return Endpoint.IPv6;
+    default:
+      throw new Error('Unsupported endpoint mode: ' + endpointMode);
+  }
+};
+
+module.exports = getMetadataServiceEndpoint;
+
+
+/***/ }),
 /* 757 */,
 /* 758 */,
 /* 759 */,
@@ -19272,48 +22818,169 @@ module.exports = resolveMonitoringConfig;
 /* 763 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
-"use strict";
+var AWS = __webpack_require__(395);
+var util = AWS.util;
+var Shape = AWS.Model.Shape;
 
-
-var isGlob = __webpack_require__(357);
-var pathPosixDirname = __webpack_require__(622).posix.dirname;
-var isWin32 = __webpack_require__(87).platform() === 'win32';
-
-var slash = '/';
-var backslash = /\\/g;
-var enclosure = /[\{\[].*[\/]*.*[\}\]]$/;
-var globby = /(^|[^\\])([\{\[]|\([^\)]+$)/;
-var escaped = /\\([\!\*\?\|\[\]\(\)\{\}])/g;
+var xml2js = __webpack_require__(992);
 
 /**
- * @param {string} str
- * @param {Object} opts
- * @param {boolean} [opts.flipBackslashes=true]
+ * @api private
  */
-module.exports = function globParent(str, opts) {
-  var options = Object.assign({ flipBackslashes: true }, opts);
-
-  // flip windows path separators
-  if (options.flipBackslashes && isWin32 && str.indexOf(slash) < 0) {
-    str = str.replace(backslash, slash);
-  }
-
-  // special case for strings ending in enclosure containing path separator
-  if (enclosure.test(str)) {
-    str += slash;
-  }
-
-  // preserves full path in case of trailing path separator
-  str += 'a';
-
-  // remove path parts that are globby
-  do {
-    str = pathPosixDirname(str);
-  } while (isGlob(str) || globby.test(str));
-
-  // remove escape chars and return result
-  return str.replace(escaped, '$1');
+var options = {  // options passed to xml2js parser
+  explicitCharkey: false, // undocumented
+  trim: false,            // trim the leading/trailing whitespace from text nodes
+  normalize: false,       // trim interior whitespace inside text nodes
+  explicitRoot: false,    // return the root node in the resulting object?
+  emptyTag: null,         // the default value for empty nodes
+  explicitArray: true,    // always put child nodes in an array
+  ignoreAttrs: false,     // ignore attributes, only create text nodes
+  mergeAttrs: false,      // merge attributes and child elements
+  validator: null         // a callable validator
 };
+
+function NodeXmlParser() { }
+
+NodeXmlParser.prototype.parse = function(xml, shape) {
+  shape = shape || {};
+
+  var result = null;
+  var error = null;
+
+  var parser = new xml2js.Parser(options);
+  parser.parseString(xml, function (e, r) {
+    error = e;
+    result = r;
+  });
+
+  if (result) {
+    var data = parseXml(result, shape);
+    if (result.ResponseMetadata) {
+      data.ResponseMetadata = parseXml(result.ResponseMetadata[0], {});
+    }
+    return data;
+  } else if (error) {
+    throw util.error(error, {code: 'XMLParserError', retryable: true});
+  } else { // empty xml document
+    return parseXml({}, shape);
+  }
+};
+
+function parseXml(xml, shape) {
+  switch (shape.type) {
+    case 'structure': return parseStructure(xml, shape);
+    case 'map': return parseMap(xml, shape);
+    case 'list': return parseList(xml, shape);
+    case undefined: case null: return parseUnknown(xml);
+    default: return parseScalar(xml, shape);
+  }
+}
+
+function parseStructure(xml, shape) {
+  var data = {};
+  if (xml === null) return data;
+
+  util.each(shape.members, function(memberName, memberShape) {
+    var xmlName = memberShape.name;
+    if (Object.prototype.hasOwnProperty.call(xml, xmlName) && Array.isArray(xml[xmlName])) {
+      var xmlChild = xml[xmlName];
+      if (!memberShape.flattened) xmlChild = xmlChild[0];
+
+      data[memberName] = parseXml(xmlChild, memberShape);
+    } else if (memberShape.isXmlAttribute &&
+               xml.$ && Object.prototype.hasOwnProperty.call(xml.$, xmlName)) {
+      data[memberName] = parseScalar(xml.$[xmlName], memberShape);
+    } else if (memberShape.type === 'list' && !shape.api.xmlNoDefaultLists) {
+      data[memberName] = memberShape.defaultValue;
+    }
+  });
+
+  return data;
+}
+
+function parseMap(xml, shape) {
+  var data = {};
+  if (xml === null) return data;
+
+  var xmlKey = shape.key.name || 'key';
+  var xmlValue = shape.value.name || 'value';
+  var iterable = shape.flattened ? xml : xml.entry;
+
+  if (Array.isArray(iterable)) {
+    util.arrayEach(iterable, function(child) {
+      data[child[xmlKey][0]] = parseXml(child[xmlValue][0], shape.value);
+    });
+  }
+
+  return data;
+}
+
+function parseList(xml, shape) {
+  var data = [];
+  var name = shape.member.name || 'member';
+  if (shape.flattened) {
+    util.arrayEach(xml, function(xmlChild) {
+      data.push(parseXml(xmlChild, shape.member));
+    });
+  } else if (xml && Array.isArray(xml[name])) {
+    util.arrayEach(xml[name], function(child) {
+      data.push(parseXml(child, shape.member));
+    });
+  }
+
+  return data;
+}
+
+function parseScalar(text, shape) {
+  if (text && text.$ && text.$.encoding === 'base64') {
+    shape = new Shape.create({type: text.$.encoding});
+  }
+  if (text && text._) text = text._;
+
+  if (typeof shape.toType === 'function') {
+    return shape.toType(text);
+  } else {
+    return text;
+  }
+}
+
+function parseUnknown(xml) {
+  if (xml === undefined || xml === null) return '';
+  if (typeof xml === 'string') return xml;
+
+  // parse a list
+  if (Array.isArray(xml)) {
+    var arr = [];
+    for (i = 0; i < xml.length; i++) {
+      arr.push(parseXml(xml[i], {}));
+    }
+    return arr;
+  }
+
+  // empty object
+  var keys = Object.keys(xml), i;
+  if (keys.length === 0 || (keys.length === 1 && keys[0] === '$')) {
+    return {};
+  }
+
+  // object, parse as structure
+  var data = {};
+  for (i = 0; i < keys.length; i++) {
+    var key = keys[i], value = xml[key];
+    if (key === '$') continue;
+    if (value.length > 1) { // this member is a list
+      data[key] = parseList(value, {member: {}});
+    } else { // this member is a single item
+      data[key] = parseXml(value[0], {});
+    }
+  }
+  return data;
+}
+
+/**
+ * @api private
+ */
+module.exports = NodeXmlParser;
 
 
 /***/ }),
@@ -19730,7 +23397,20 @@ module.exports = function globParent(str, opts) {
 
 /***/ }),
 /* 769 */,
-/* 770 */,
+/* 770 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.isEnoentCodeError = void 0;
+function isEnoentCodeError(error) {
+    return error.code === 'ENOENT';
+}
+exports.isEnoentCodeError = isEnoentCodeError;
+
+
+/***/ }),
 /* 771 */,
 /* 772 */,
 /* 773 */,
@@ -19741,7 +23421,7 @@ module.exports = function globParent(str, opts) {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", { value: true });
-const stream_1 = __webpack_require__(413);
+const stream_1 = __webpack_require__(794);
 const stream_2 = __webpack_require__(608);
 const provider_1 = __webpack_require__(589);
 class ProviderStream extends provider_1.default {
@@ -19784,7 +23464,7 @@ var apiLoader = AWS.apiLoader;
 
 apiLoader.services['s3'] = {};
 AWS.S3 = Service.defineService('s3', ['2006-03-01']);
-__webpack_require__(16);
+__webpack_require__(158);
 Object.defineProperty(apiLoader.services['s3'], '2006-03-01', {
   get: function get() {
     var model = __webpack_require__(897);
@@ -19811,7 +23491,7 @@ module.exports = AWS.S3;
 "use strict";
 
 
-const stringify = __webpack_require__(326);
+const stringify = __webpack_require__(382);
 const compile = __webpack_require__(435);
 const expand = __webpack_require__(441);
 const parse = __webpack_require__(227);
@@ -20071,6 +23751,7 @@ function Api(api, options) {
     property(this, 'documentation', api.documentation);
     property(this, 'documentationUrl', api.documentationUrl);
   }
+  property(this, 'awsQueryCompatible', api.metadata.awsQueryCompatible);
 }
 
 /**
@@ -20461,7 +24142,12 @@ module.exports = AWS.Signers.V3;
 /***/ }),
 /* 792 */,
 /* 793 */,
-/* 794 */,
+/* 794 */
+/***/ (function(module) {
+
+module.exports = require("stream");
+
+/***/ }),
 /* 795 */,
 /* 796 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
@@ -20587,7 +24273,7 @@ module.exports = AWS.Signers.V3;
 "use strict";
 
 Object.defineProperty(exports, "__esModule", { value: true });
-const stream_1 = __webpack_require__(413);
+const stream_1 = __webpack_require__(794);
 const async_1 = __webpack_require__(291);
 class StreamProvider {
     constructor(_root, _settings) {
@@ -20821,6 +24507,18 @@ exports.default = StreamProvider;
   var TYPE_NULL = 7;
   var TYPE_ARRAY_NUMBER = 8;
   var TYPE_ARRAY_STRING = 9;
+  var TYPE_NAME_TABLE = {
+    0: 'number',
+    1: 'any',
+    2: 'string',
+    3: 'array',
+    4: 'object',
+    5: 'boolean',
+    6: 'expression',
+    7: 'null',
+    8: 'Array<number>',
+    9: 'Array<string>'
+  };
 
   var TOK_EOF = "EOF";
   var TOK_UNQUOTEDIDENTIFIER = "UnquotedIdentifier";
@@ -21232,10 +24930,8 @@ exports.default = StreamProvider;
             var node = {type: "Field", name: token.value};
             if (this._lookahead(0) === TOK_LPAREN) {
                 throw new Error("Quoted identifier not allowed for function names.");
-            } else {
-                return node;
             }
-            break;
+            return node;
           case TOK_NOT:
             right = this.expression(bindingPower.Not);
             return {type: "NotExpression", children: [right]};
@@ -21269,10 +24965,8 @@ exports.default = StreamProvider;
                 right = this._parseProjectionRHS(bindingPower.Star);
                 return {type: "Projection",
                         children: [{type: "Identity"}, right]};
-            } else {
-                return this._parseMultiselectList();
             }
-            break;
+            return this._parseMultiselectList();
           case TOK_CURRENT:
             return {type: TOK_CURRENT};
           case TOK_EXPREF:
@@ -21304,13 +24998,11 @@ exports.default = StreamProvider;
             if (this._lookahead(0) !== TOK_STAR) {
                 right = this._parseDotRHS(rbp);
                 return {type: "Subexpression", children: [left, right]};
-            } else {
-                // Creating a projection.
-                this._advance();
-                right = this._parseProjectionRHS(rbp);
-                return {type: "ValueProjection", children: [left, right]};
             }
-            break;
+            // Creating a projection.
+            this._advance();
+            right = this._parseProjectionRHS(rbp);
+            return {type: "ValueProjection", children: [left, right]};
           case TOK_PIPE:
             right = this.expression(bindingPower.Pipe);
             return {type: TOK_PIPE, children: [left, right]};
@@ -21364,13 +25056,11 @@ exports.default = StreamProvider;
             if (token.type === TOK_NUMBER || token.type === TOK_COLON) {
                 right = this._parseIndexExpression();
                 return this._projectIfSlice(left, right);
-            } else {
-                this._match(TOK_STAR);
-                this._match(TOK_RBRACKET);
-                right = this._parseProjectionRHS(bindingPower.Star);
-                return {type: "Projection", children: [left, right]};
             }
-            break;
+            this._match(TOK_STAR);
+            this._match(TOK_RBRACKET);
+            right = this._parseProjectionRHS(bindingPower.Star);
+            return {type: "Projection", children: [left, right]};
           default:
             this._errorToken(this._lookaheadToken(0));
         }
@@ -21547,19 +25237,15 @@ exports.default = StreamProvider;
           var matched, current, result, first, second, field, left, right, collected, i;
           switch (node.type) {
             case "Field":
-              if (value === null ) {
-                  return null;
-              } else if (isObject(value)) {
+              if (value !== null && isObject(value)) {
                   field = value[node.name];
                   if (field === undefined) {
                       return null;
                   } else {
                       return field;
                   }
-              } else {
-                return null;
               }
-              break;
+              return null;
             case "Subexpression":
               result = this.visit(node.children[0], value);
               for (i = 1; i < node.children.length; i++) {
@@ -21930,11 +25616,16 @@ exports.default = StreamProvider;
                 }
             }
             if (!typeMatched) {
+                var expected = currentSpec
+                    .map(function(typeIdentifier) {
+                        return TYPE_NAME_TABLE[typeIdentifier];
+                    })
+                    .join(',');
                 throw new Error("TypeError: " + name + "() " +
                                 "expected argument " + (i + 1) +
-                                " to be type " + currentSpec +
-                                " but received type " + actualType +
-                                " instead.");
+                                " to be type " + expected +
+                                " but received type " +
+                                TYPE_NAME_TABLE[actualType] + " instead.");
             }
         }
     },
@@ -22349,7 +26040,35 @@ exports.default = StreamProvider;
 
 
 /***/ }),
-/* 803 */,
+/* 803 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _crypto = _interopRequireDefault(__webpack_require__(417));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function md5(bytes) {
+  if (Array.isArray(bytes)) {
+    bytes = Buffer.from(bytes);
+  } else if (typeof bytes === 'string') {
+    bytes = Buffer.from(bytes, 'utf8');
+  }
+
+  return _crypto.default.createHash('md5').update(bytes).digest();
+}
+
+var _default = md5;
+exports.default = _default;
+
+/***/ }),
 /* 804 */,
 /* 805 */,
 /* 806 */
@@ -22376,6 +26095,7 @@ function translate(value, shape) {
 
 function translateStructure(structure, shape) {
   if (structure == null) return undefined;
+  if (shape.isDocument) return structure;
 
   var struct = {};
   var shapeMembers = shape.members;
@@ -22492,172 +26212,116 @@ module.exports = {
 /* 808 */,
 /* 809 */,
 /* 810 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
 
-var AWS = __webpack_require__(395);
-var util = AWS.util;
-var Shape = AWS.Model.Shape;
+"use strict";
 
-var xml2js = __webpack_require__(992);
 
-/**
- * @api private
- */
-var options = {  // options passed to xml2js parser
-  explicitCharkey: false, // undocumented
-  trim: false,            // trim the leading/trailing whitespace from text nodes
-  normalize: false,       // trim interior whitespace inside text nodes
-  explicitRoot: false,    // return the root node in the resulting object?
-  emptyTag: null,         // the default value for empty nodes
-  explicitArray: true,    // always put child nodes in an array
-  ignoreAttrs: false,     // ignore attributes, only create text nodes
-  mergeAttrs: false,      // merge attributes and child elements
-  validator: null         // a callable validator
-};
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
 
-function NodeXmlParser() { }
+var _rng = _interopRequireDefault(__webpack_require__(506));
 
-NodeXmlParser.prototype.parse = function(xml, shape) {
-  shape = shape || {};
+var _stringify = _interopRequireDefault(__webpack_require__(960));
 
-  var result = null;
-  var error = null;
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
 
-  var parser = new xml2js.Parser(options);
-  parser.parseString(xml, function (e, r) {
-    error = e;
-    result = r;
-  });
+// **`v1()` - Generate time-based UUID**
+//
+// Inspired by https://github.com/LiosK/UUID.js
+// and http://docs.python.org/library/uuid.html
+let _nodeId;
 
-  if (result) {
-    var data = parseXml(result, shape);
-    if (result.ResponseMetadata) {
-      data.ResponseMetadata = parseXml(result.ResponseMetadata[0], {});
+let _clockseq; // Previous uuid creation time
+
+
+let _lastMSecs = 0;
+let _lastNSecs = 0; // See https://github.com/uuidjs/uuid for API details
+
+function v1(options, buf, offset) {
+  let i = buf && offset || 0;
+  const b = buf || new Array(16);
+  options = options || {};
+  let node = options.node || _nodeId;
+  let clockseq = options.clockseq !== undefined ? options.clockseq : _clockseq; // node and clockseq need to be initialized to random values if they're not
+  // specified.  We do this lazily to minimize issues related to insufficient
+  // system entropy.  See #189
+
+  if (node == null || clockseq == null) {
+    const seedBytes = options.random || (options.rng || _rng.default)();
+
+    if (node == null) {
+      // Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
+      node = _nodeId = [seedBytes[0] | 0x01, seedBytes[1], seedBytes[2], seedBytes[3], seedBytes[4], seedBytes[5]];
     }
-    return data;
-  } else if (error) {
-    throw util.error(error, {code: 'XMLParserError', retryable: true});
-  } else { // empty xml document
-    return parseXml({}, shape);
-  }
-};
 
-function parseXml(xml, shape) {
-  switch (shape.type) {
-    case 'structure': return parseStructure(xml, shape);
-    case 'map': return parseMap(xml, shape);
-    case 'list': return parseList(xml, shape);
-    case undefined: case null: return parseUnknown(xml);
-    default: return parseScalar(xml, shape);
-  }
-}
-
-function parseStructure(xml, shape) {
-  var data = {};
-  if (xml === null) return data;
-
-  util.each(shape.members, function(memberName, memberShape) {
-    var xmlName = memberShape.name;
-    if (Object.prototype.hasOwnProperty.call(xml, xmlName) && Array.isArray(xml[xmlName])) {
-      var xmlChild = xml[xmlName];
-      if (!memberShape.flattened) xmlChild = xmlChild[0];
-
-      data[memberName] = parseXml(xmlChild, memberShape);
-    } else if (memberShape.isXmlAttribute &&
-               xml.$ && Object.prototype.hasOwnProperty.call(xml.$, xmlName)) {
-      data[memberName] = parseScalar(xml.$[xmlName], memberShape);
-    } else if (memberShape.type === 'list' && !shape.api.xmlNoDefaultLists) {
-      data[memberName] = memberShape.defaultValue;
+    if (clockseq == null) {
+      // Per 4.2.2, randomize (14 bit) clockseq
+      clockseq = _clockseq = (seedBytes[6] << 8 | seedBytes[7]) & 0x3fff;
     }
-  });
+  } // UUID timestamps are 100 nano-second units since the Gregorian epoch,
+  // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
+  // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
+  // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
 
-  return data;
+
+  let msecs = options.msecs !== undefined ? options.msecs : Date.now(); // Per 4.2.1.2, use count of uuid's generated during the current clock
+  // cycle to simulate higher resolution clock
+
+  let nsecs = options.nsecs !== undefined ? options.nsecs : _lastNSecs + 1; // Time since last uuid creation (in msecs)
+
+  const dt = msecs - _lastMSecs + (nsecs - _lastNSecs) / 10000; // Per 4.2.1.2, Bump clockseq on clock regression
+
+  if (dt < 0 && options.clockseq === undefined) {
+    clockseq = clockseq + 1 & 0x3fff;
+  } // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
+  // time interval
+
+
+  if ((dt < 0 || msecs > _lastMSecs) && options.nsecs === undefined) {
+    nsecs = 0;
+  } // Per 4.2.1.2 Throw error if too many uuids are requested
+
+
+  if (nsecs >= 10000) {
+    throw new Error("uuid.v1(): Can't create more than 10M uuids/sec");
+  }
+
+  _lastMSecs = msecs;
+  _lastNSecs = nsecs;
+  _clockseq = clockseq; // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
+
+  msecs += 12219292800000; // `time_low`
+
+  const tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
+  b[i++] = tl >>> 24 & 0xff;
+  b[i++] = tl >>> 16 & 0xff;
+  b[i++] = tl >>> 8 & 0xff;
+  b[i++] = tl & 0xff; // `time_mid`
+
+  const tmh = msecs / 0x100000000 * 10000 & 0xfffffff;
+  b[i++] = tmh >>> 8 & 0xff;
+  b[i++] = tmh & 0xff; // `time_high_and_version`
+
+  b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
+
+  b[i++] = tmh >>> 16 & 0xff; // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
+
+  b[i++] = clockseq >>> 8 | 0x80; // `clock_seq_low`
+
+  b[i++] = clockseq & 0xff; // `node`
+
+  for (let n = 0; n < 6; ++n) {
+    b[i + n] = node[n];
+  }
+
+  return buf || (0, _stringify.default)(b);
 }
 
-function parseMap(xml, shape) {
-  var data = {};
-  if (xml === null) return data;
-
-  var xmlKey = shape.key.name || 'key';
-  var xmlValue = shape.value.name || 'value';
-  var iterable = shape.flattened ? xml : xml.entry;
-
-  if (Array.isArray(iterable)) {
-    util.arrayEach(iterable, function(child) {
-      data[child[xmlKey][0]] = parseXml(child[xmlValue][0], shape.value);
-    });
-  }
-
-  return data;
-}
-
-function parseList(xml, shape) {
-  var data = [];
-  var name = shape.member.name || 'member';
-  if (shape.flattened) {
-    util.arrayEach(xml, function(xmlChild) {
-      data.push(parseXml(xmlChild, shape.member));
-    });
-  } else if (xml && Array.isArray(xml[name])) {
-    util.arrayEach(xml[name], function(child) {
-      data.push(parseXml(child, shape.member));
-    });
-  }
-
-  return data;
-}
-
-function parseScalar(text, shape) {
-  if (text && text.$ && text.$.encoding === 'base64') {
-    shape = new Shape.create({type: text.$.encoding});
-  }
-  if (text && text._) text = text._;
-
-  if (typeof shape.toType === 'function') {
-    return shape.toType(text);
-  } else {
-    return text;
-  }
-}
-
-function parseUnknown(xml) {
-  if (xml === undefined || xml === null) return '';
-  if (typeof xml === 'string') return xml;
-
-  // parse a list
-  if (Array.isArray(xml)) {
-    var arr = [];
-    for (i = 0; i < xml.length; i++) {
-      arr.push(parseXml(xml[i], {}));
-    }
-    return arr;
-  }
-
-  // empty object
-  var keys = Object.keys(xml), i;
-  if (keys.length === 0 || keys === ['$']) {
-    return {};
-  }
-
-  // object, parse as structure
-  var data = {};
-  for (i = 0; i < keys.length; i++) {
-    var key = keys[i], value = xml[key];
-    if (key === '$') continue;
-    if (value.length > 1) { // this member is a list
-      data[key] = parseList(value, {member: {}});
-    } else { // this member is a single item
-      data[key] = parseXml(value[0], {});
-    }
-  }
-  return data;
-}
-
-/**
- * @api private
- */
-module.exports = NodeXmlParser;
-
+var _default = v1;
+exports.default = _default;
 
 /***/ }),
 /* 811 */,
@@ -22674,18 +26338,32 @@ var AWS = __webpack_require__(395);
 var os = __webpack_require__(87);
 var path = __webpack_require__(622);
 
-function parseFile(filename, isConfig) {
-    var content = AWS.util.ini.parse(AWS.util.readFileSync(filename));
-    var tmpContent = {};
-    Object.keys(content).forEach(function(profileName) {
-      var profileContent = content[profileName];
-      profileName = isConfig ? profileName.replace(/^profile\s/, '') : profileName;
-      Object.defineProperty(tmpContent, profileName, {
-        value: profileContent,
-        enumerable: true
-      });
+function parseFile(filename) {
+  return AWS.util.ini.parse(AWS.util.readFileSync(filename));
+}
+
+function getProfiles(fileContent) {
+  var tmpContent = {};
+  Object.keys(fileContent).forEach(function(sectionName) {
+    if (/^sso-session\s/.test(sectionName)) return;
+    Object.defineProperty(tmpContent, sectionName.replace(/^profile\s/, ''), {
+      value: fileContent[sectionName],
+      enumerable: true
     });
-    return tmpContent;
+  });
+  return tmpContent;
+}
+
+function getSsoSessions(fileContent) {
+  var tmpContent = {};
+  Object.keys(fileContent).forEach(function(sectionName) {
+    if (!/^sso-session\s/.test(sectionName)) return;
+    Object.defineProperty(tmpContent, sectionName.replace(/^sso-session\s/, ''), {
+      value: fileContent[sectionName],
+      enumerable: true
+    });
+  });
+  return tmpContent;
 }
 
 /**
@@ -22700,41 +26378,66 @@ function parseFile(filename, isConfig) {
 AWS.IniLoader = AWS.util.inherit({
   constructor: function IniLoader() {
     this.resolvedProfiles = {};
+    this.resolvedSsoSessions = {};
   },
 
   /** Remove all cached files. Used after config files are updated. */
   clearCachedFiles: function clearCachedFiles() {
     this.resolvedProfiles = {};
+    this.resolvedSsoSessions = {};
   },
 
-/**
- * Load configurations from config/credentials files and cache them
- * for later use. If no file is specified it will try to load default
- * files.
- * @param options [map] information describing the file
- * @option options filename [String] ('~/.aws/credentials' or defined by
- *   AWS_SHARED_CREDENTIALS_FILE process env var or '~/.aws/config' if
- *   isConfig is set to true)
- *   path to the file to be read.
- * @option options isConfig [Boolean] (false) True to read config file.
- * @return [map<String,String>] object containing contents from file in key-value
- *   pairs.
- */
+  /**
+   * Load configurations from config/credentials files and cache them
+   * for later use. If no file is specified it will try to load default files.
+   *
+   * @param options [map] information describing the file
+   * @option options filename [String] ('~/.aws/credentials' or defined by
+   *   AWS_SHARED_CREDENTIALS_FILE process env var or '~/.aws/config' if
+   *   isConfig is set to true)
+   *   path to the file to be read.
+   * @option options isConfig [Boolean] (false) True to read config file.
+   * @return [map<String,String>] object containing contents from file in key-value
+   *   pairs.
+   */
   loadFrom: function loadFrom(options) {
     options = options || {};
     var isConfig = options.isConfig === true;
     var filename = options.filename || this.getDefaultFilePath(isConfig);
     if (!this.resolvedProfiles[filename]) {
-      var fileContent = this.parseFile(filename, isConfig);
-      Object.defineProperty(this.resolvedProfiles, filename, { value: fileContent });
+      var fileContent = parseFile(filename);
+      if (isConfig) {
+        Object.defineProperty(this.resolvedProfiles, filename, {
+          value: getProfiles(fileContent)
+        });
+      } else {
+        Object.defineProperty(this.resolvedProfiles, filename, { value: fileContent });
+      }
     }
     return this.resolvedProfiles[filename];
   },
 
   /**
-   * @api private
+   * Load sso sessions from config/credentials files and cache them
+   * for later use. If no file is specified it will try to load default file.
+   *
+   * @param options [map] information describing the file
+   * @option options filename [String] ('~/.aws/config' or defined by
+   *   AWS_CONFIG_FILE process env var)
+   * @return [map<String,String>] object containing contents from file in key-value
+   *   pairs.
    */
-  parseFile: parseFile,
+  loadSsoSessionsFrom: function loadSsoSessionsFrom(options) {
+    options = options || {};
+    var filename = options.filename || this.getDefaultFilePath(true);
+    if (!this.resolvedSsoSessions[filename]) {
+      var fileContent = parseFile(filename);
+      Object.defineProperty(this.resolvedSsoSessions, filename, {
+        value: getSsoSessions(fileContent)
+      });
+    }
+    return this.resolvedSsoSessions[filename];
+  },
 
   /**
    * @api private
@@ -22773,8 +26476,7 @@ AWS.IniLoader = AWS.util.inherit({
 var IniLoader = AWS.IniLoader;
 
 module.exports = {
-  IniLoader: IniLoader,
-  parseFile: parseFile,
+  IniLoader: IniLoader
 };
 
 
@@ -22891,41 +26593,7 @@ module.exports = {
 /* 823 */,
 /* 824 */,
 /* 825 */,
-/* 826 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
-
-var rng = __webpack_require__(139);
-var bytesToUuid = __webpack_require__(722);
-
-function v4(options, buf, offset) {
-  var i = buf && offset || 0;
-
-  if (typeof(options) == 'string') {
-    buf = options === 'binary' ? new Array(16) : null;
-    options = null;
-  }
-  options = options || {};
-
-  var rnds = options.random || (options.rng || rng)();
-
-  // Per 4.4, set bits for version and `clock_seq_hi_and_reserved`
-  rnds[6] = (rnds[6] & 0x0f) | 0x40;
-  rnds[8] = (rnds[8] & 0x3f) | 0x80;
-
-  // Copy bytes to buffer, if provided
-  if (buf) {
-    for (var ii = 0; ii < 16; ++ii) {
-      buf[i + ii] = rnds[ii];
-    }
-  }
-
-  return buf || bytesToUuid(rnds);
-}
-
-module.exports = v4;
-
-
-/***/ }),
+/* 826 */,
 /* 827 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
@@ -23201,6 +26869,7 @@ AWS.Signers.RequestSigner.getVersion = function getVersion(version) {
     case 'v4': return AWS.Signers.V4;
     case 's3': return AWS.Signers.S3;
     case 'v3https': return AWS.Signers.V3Https;
+    case 'bearer': return AWS.Signers.Bearer;
   }
   throw new Error('Unknown signing version ' + version);
 };
@@ -23211,6 +26880,7 @@ __webpack_require__(566);
 __webpack_require__(754);
 __webpack_require__(616);
 __webpack_require__(951);
+__webpack_require__(143);
 
 
 /***/ }),
@@ -23222,7 +26892,26 @@ __webpack_require__(951);
 /* 841 */,
 /* 842 */,
 /* 843 */,
-/* 844 */,
+/* 844 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = rng;
+
+var _crypto = _interopRequireDefault(__webpack_require__(417));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+function rng() {
+  return _crypto.default.randomBytes(16);
+}
+
+/***/ }),
 /* 845 */,
 /* 846 */,
 /* 847 */,
@@ -23959,12 +27648,18 @@ AWS.S3.ManagedUpload = AWS.util.inherit({
     if (!self.service) {
       self.service = new AWS.S3({params: params});
     } else {
+      // Create a new S3 client from the supplied client's constructor.
       var service = self.service;
-      var config = AWS.util.copy(service._originalConfig || {});
+      var config = AWS.util.copy(service.config);
       config.signatureVersion = service.getSignatureVersion();
       self.service = new service.constructor.__super__(config);
       self.service.config.params =
         AWS.util.merge(self.service.config.params || {}, params);
+      Object.defineProperty(self.service, '_originalConfig', {
+        get: function() { return service._originalConfig; },
+        enumerable: false,
+        configurable: true
+      });
     }
   },
 
@@ -24244,7 +27939,7 @@ AWS.S3.ManagedUpload = AWS.util.inherit({
       if (self.completeInfo[partNumber] && self.completeInfo[partNumber].ETag !== null) return null;
       partInfo.ETag = data.ETag;
       self.doneParts++;
-      if (self.isDoneChunking && self.doneParts === self.numParts) {
+      if (self.isDoneChunking && self.doneParts === self.totalPartNumbers) {
         self.finishMultiPart();
       } else {
         self.fillQueue.call(self);
@@ -24405,33 +28100,253 @@ module.exports = AWS.S3.ManagedUpload;
 /***/ }),
 /* 857 */,
 /* 858 */
-/***/ (function(__unusedmodule, exports, __webpack_require__) {
+/***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
 
-"use strict";
+var AWS = __webpack_require__(395);
+var crypto = __webpack_require__(417);
+var fs = __webpack_require__(747);
+var path = __webpack_require__(622);
+var iniLoader = AWS.util.iniLoader;
 
-Object.defineProperty(exports, "__esModule", { value: true });
-const async = __webpack_require__(728);
-const sync = __webpack_require__(593);
-const settings_1 = __webpack_require__(518);
-exports.Settings = settings_1.default;
-function stat(path, optionsOrSettingsOrCallback, callback) {
-    if (typeof optionsOrSettingsOrCallback === 'function') {
-        return async.read(path, getSettings(), optionsOrSettingsOrCallback);
+// Tracking refresh attempt to ensure refresh is not attempted more than once every 30 seconds.
+var lastRefreshAttemptTime = 0;
+
+/**
+ * Throws error is key is not present in token object.
+ *
+ * @param token [Object] Object to be validated.
+ * @param key [String] The key to be validated on the object.
+ */
+var validateTokenKey = function validateTokenKey(token, key) {
+  if (!token[key]) {
+    throw AWS.util.error(
+      new Error('Key "' + key + '" not present in SSO Token'),
+      { code: 'SSOTokenProviderFailure' }
+    );
+  }
+};
+
+/**
+ * Calls callback function with or without error based on provided times in case
+ * of unsuccessful refresh.
+ *
+ * @param currentTime [number] current time in milliseconds since ECMAScript epoch.
+ * @param tokenExpireTime [number] token expire time in milliseconds since ECMAScript epoch.
+ * @param callback [Function] Callback to call in case of error.
+ */
+var refreshUnsuccessful = function refreshUnsuccessful(
+  currentTime,
+  tokenExpireTime,
+  callback
+) {
+  if (tokenExpireTime > currentTime) {
+    // Cached token is still valid, return.
+    callback(null);
+  } else {
+    // Token invalid, throw error requesting user to sso login.
+    throw AWS.util.error(
+      new Error('SSO Token refresh failed. Please log in using "aws sso login"'),
+      { code: 'SSOTokenProviderFailure' }
+    );
+  }
+};
+
+/**
+ * Represents token loaded from disk derived from the AWS SSO device grant authorication flow.
+ *
+ * ## Using SSO Token Provider
+ *
+ * This provider is checked by default in the Node.js environment in TokenProviderChain.
+ * To use the SSO Token Provider, simply add your SSO Start URL and Region to the
+ * ~/.aws/config file in the following format:
+ *
+ *     [default]
+ *     sso_start_url = https://d-abc123.awsapps.com/start
+ *     sso_region = us-east-1
+ *
+ * ## Using custom profiles
+ *
+ * The SDK supports loading token for separate profiles. This can be done in two ways:
+ *
+ * 1. Set the `AWS_PROFILE` environment variable in your process prior to loading the SDK.
+ * 2. Directly load the AWS.SSOTokenProvider:
+ *
+ * ```javascript
+ * var ssoTokenProvider = new AWS.SSOTokenProvider({profile: 'myprofile'});
+ * ```
+ *
+ * @!macro nobrowser
+ */
+AWS.SSOTokenProvider = AWS.util.inherit(AWS.Token, {
+  /**
+   * Expiry window of five minutes.
+   */
+  expiryWindow: 5 * 60,
+
+  /**
+   * Creates a new token object from cached access token.
+   *
+   * @param options [map] a set of options
+   * @option options profile [String] (AWS_PROFILE env var or 'default')
+   *   the name of the profile to load.
+   * @option options callback [Function] (err) Token is eagerly loaded
+   *   by the constructor. When the callback is called with no error, the
+   *   token has been loaded successfully.
+   */
+  constructor: function SSOTokenProvider(options) {
+    AWS.Token.call(this);
+
+    options = options || {};
+
+    this.expired = true;
+    this.profile = options.profile || process.env.AWS_PROFILE || AWS.util.defaultProfile;
+    this.get(options.callback || AWS.util.fn.noop);
+  },
+
+  /**
+   * Reads sso_start_url from provided profile, and reads token from
+   * ~/.aws/sso/cache/<sha1-of-utf8-encoded-value-from-sso_start_url>.json
+   *
+   * Throws an error if required fields token and expiresAt are missing.
+   * Throws an error if token has expired and metadata to perform refresh is
+   * not available.
+   * Attempts to refresh the token if it's within 5 minutes before expiry time.
+   *
+   * @api private
+   */
+  load: function load(callback) {
+    var self = this;
+    var profiles = iniLoader.loadFrom({ isConfig: true });
+    var profile = profiles[this.profile] || {};
+
+    if (Object.keys(profile).length === 0) {
+      throw AWS.util.error(
+        new Error('Profile "' + this.profile + '" not found'),
+        { code: 'SSOTokenProviderFailure' }
+      );
+    } else if (!profile['sso_session']) {
+      throw AWS.util.error(
+        new Error('Profile "' + profileName + '" is missing required property "sso_session".'),
+        { code: 'SSOTokenProviderFailure' }
+      );
     }
-    async.read(path, getSettings(optionsOrSettingsOrCallback), callback);
-}
-exports.stat = stat;
-function statSync(path, optionsOrSettings) {
-    const settings = getSettings(optionsOrSettings);
-    return sync.read(path, settings);
-}
-exports.statSync = statSync;
-function getSettings(settingsOrOptions = {}) {
-    if (settingsOrOptions instanceof settings_1.default) {
-        return settingsOrOptions;
+
+    var ssoSessionName = profile['sso_session'];
+    var ssoSessions = iniLoader.loadSsoSessionsFrom();
+    var ssoSession = ssoSessions[ssoSessionName];
+
+    if (!ssoSession) {
+      throw AWS.util.error(
+        new Error('Sso session "' + ssoSessionName + '" not found'),
+        { code: 'SSOTokenProviderFailure' }
+      );
+    } else if (!ssoSession['sso_start_url']) {
+      throw AWS.util.error(
+        new Error('Sso session "' + profileName + '" is missing required property "sso_start_url".'),
+        { code: 'SSOTokenProviderFailure' }
+      );
+    } else if (!ssoSession['sso_region']) {
+      throw AWS.util.error(
+        new Error('Sso session "' + profileName + '" is missing required property "sso_region".'),
+        { code: 'SSOTokenProviderFailure' }
+      );
     }
-    return new settings_1.default(settingsOrOptions);
-}
+
+    var hasher = crypto.createHash('sha1');
+    var fileName = hasher.update(ssoSessionName).digest('hex') + '.json';
+    var cachePath = path.join(iniLoader.getHomeDir(), '.aws', 'sso', 'cache', fileName);
+    var tokenFromCache = JSON.parse(fs.readFileSync(cachePath));
+
+    if (!tokenFromCache) {
+      throw AWS.util.error(
+        new Error('Cached token not found. Please log in using "aws sso login"'
+          + ' for profile "' + this.profile + '".'),
+        { code: 'SSOTokenProviderFailure' }
+      );
+    }
+
+    validateTokenKey(tokenFromCache, 'accessToken');
+    validateTokenKey(tokenFromCache, 'expiresAt');
+
+    var currentTime = AWS.util.date.getDate().getTime();
+    var adjustedTime = new Date(currentTime + this.expiryWindow * 1000);
+    var tokenExpireTime = new Date(tokenFromCache['expiresAt']);
+
+    if (tokenExpireTime > adjustedTime) {
+      // Token is valid and not expired.
+      self.token = tokenFromCache.accessToken;
+      self.expireTime = tokenExpireTime;
+      self.expired = false;
+      callback(null);
+      return;
+    }
+
+    // Skip new refresh, if last refresh was done within 30 seconds.
+    if (currentTime - lastRefreshAttemptTime < 30 * 1000) {
+      refreshUnsuccessful(currentTime, tokenExpireTime, callback);
+      return;
+    }
+
+    // Token is in expiry window, refresh from SSOOIDC.createToken() call.
+    validateTokenKey(tokenFromCache, 'clientId');
+    validateTokenKey(tokenFromCache, 'clientSecret');
+    validateTokenKey(tokenFromCache, 'refreshToken');
+
+    if (!self.service || self.service.config.region !== ssoSession.sso_region) {
+      self.service = new AWS.SSOOIDC({ region: ssoSession.sso_region });
+    }
+
+    var params = {
+      clientId: tokenFromCache.clientId,
+      clientSecret: tokenFromCache.clientSecret,
+      refreshToken: tokenFromCache.refreshToken,
+      grantType: 'refresh_token',
+    };
+
+    lastRefreshAttemptTime = AWS.util.date.getDate().getTime();
+    self.service.createToken(params, function(err, data) {
+      if (err || !data) {
+        refreshUnsuccessful(currentTime, tokenExpireTime, callback);
+      } else {
+        try {
+          validateTokenKey(data, 'accessToken');
+          validateTokenKey(data, 'expiresIn');
+          self.expired = false;
+          self.token = data.accessToken;
+          self.expireTime = new Date(Date.now() + data.expiresIn * 1000);
+          callback(null);
+
+          try {
+            // Write updated token data to disk.
+            tokenFromCache.accessToken = data.accessToken;
+            tokenFromCache.expiresAt = self.expireTime.toISOString();
+            tokenFromCache.refreshToken = data.refreshToken;
+            fs.writeFileSync(cachePath, JSON.stringify(tokenFromCache, null, 2));
+          } catch (error) {
+            // Swallow error if unable to write token to file.
+          }
+        } catch (error) {
+          refreshUnsuccessful(currentTime, tokenExpireTime, callback);
+        }
+      }
+    });
+  },
+
+  /**
+   * Loads the cached access token from disk.
+   *
+   * @callback callback function(err)
+   *   Called after the AWS SSO process has been executed. When this
+   *   callback is called with no error, it means that the token information
+   *   has been loaded into the object (as the `token` property).
+   *   @param err [Error] if an error occurred, this value will be filled.
+   * @see get
+   */
+  refresh: function refresh(callback) {
+    iniLoader.clearCachedFiles();
+    this.coalesceRefresh(callback || AWS.util.fn.callback);
+  },
+});
 
 
 /***/ }),
@@ -24533,7 +28448,7 @@ AWS.util.update(AWS.STS.prototype, {
 /***/ (function(module, __unusedexports, __webpack_require__) {
 
 var util = __webpack_require__(395).util;
-var Transform = __webpack_require__(413).Transform;
+var Transform = __webpack_require__(794).Transform;
 var allocBuffer = util.buffer.alloc;
 
 /** @type {Transform} */
@@ -24666,7 +28581,7 @@ module.exports = {
 
 var AWS = __webpack_require__(395);
 var fs = __webpack_require__(747);
-var STS = __webpack_require__(733);
+var STS = __webpack_require__(106);
 var iniLoader = AWS.util.iniLoader;
 
 /**
@@ -25001,18 +28916,84 @@ exports.createFileSystemAdapter = createFileSystemAdapter;
 
 /***/ }),
 /* 875 */,
-/* 876 */
-/***/ (function(module) {
-
-module.exports = require("http");
-
-/***/ }),
+/* 876 */,
 /* 877 */,
 /* 878 */,
 /* 879 */,
 /* 880 */,
 /* 881 */,
-/* 882 */,
+/* 882 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.convertPatternGroupToTask = exports.convertPatternGroupsToTasks = exports.groupPatternsByBaseDirectory = exports.getNegativePatternsAsPositive = exports.getPositivePatterns = exports.convertPatternsToTasks = exports.generate = void 0;
+const utils = __webpack_require__(501);
+function generate(patterns, settings) {
+    const positivePatterns = getPositivePatterns(patterns);
+    const negativePatterns = getNegativePatternsAsPositive(patterns, settings.ignore);
+    const staticPatterns = positivePatterns.filter((pattern) => utils.pattern.isStaticPattern(pattern, settings));
+    const dynamicPatterns = positivePatterns.filter((pattern) => utils.pattern.isDynamicPattern(pattern, settings));
+    const staticTasks = convertPatternsToTasks(staticPatterns, negativePatterns, /* dynamic */ false);
+    const dynamicTasks = convertPatternsToTasks(dynamicPatterns, negativePatterns, /* dynamic */ true);
+    return staticTasks.concat(dynamicTasks);
+}
+exports.generate = generate;
+function convertPatternsToTasks(positive, negative, dynamic) {
+    const positivePatternsGroup = groupPatternsByBaseDirectory(positive);
+    // When we have a global group – there is no reason to divide the patterns into independent tasks.
+    // In this case, the global task covers the rest.
+    if ('.' in positivePatternsGroup) {
+        const task = convertPatternGroupToTask('.', positive, negative, dynamic);
+        return [task];
+    }
+    return convertPatternGroupsToTasks(positivePatternsGroup, negative, dynamic);
+}
+exports.convertPatternsToTasks = convertPatternsToTasks;
+function getPositivePatterns(patterns) {
+    return utils.pattern.getPositivePatterns(patterns);
+}
+exports.getPositivePatterns = getPositivePatterns;
+function getNegativePatternsAsPositive(patterns, ignore) {
+    const negative = utils.pattern.getNegativePatterns(patterns).concat(ignore);
+    const positive = negative.map(utils.pattern.convertToPositivePattern);
+    return positive;
+}
+exports.getNegativePatternsAsPositive = getNegativePatternsAsPositive;
+function groupPatternsByBaseDirectory(patterns) {
+    const group = {};
+    return patterns.reduce((collection, pattern) => {
+        const base = utils.pattern.getBaseDirectory(pattern);
+        if (base in collection) {
+            collection[base].push(pattern);
+        }
+        else {
+            collection[base] = [pattern];
+        }
+        return collection;
+    }, group);
+}
+exports.groupPatternsByBaseDirectory = groupPatternsByBaseDirectory;
+function convertPatternGroupsToTasks(positive, negative, dynamic) {
+    return Object.keys(positive).map((base) => {
+        return convertPatternGroupToTask(base, positive[base], negative, dynamic);
+    });
+}
+exports.convertPatternGroupsToTasks = convertPatternGroupsToTasks;
+function convertPatternGroupToTask(base, positive, negative, dynamic) {
+    return {
+        dynamic,
+        positive,
+        negative,
+        base,
+        patterns: [].concat(positive, negative.map(utils.pattern.convertToNegativePattern))
+    };
+}
+exports.convertPatternGroupToTask = convertPatternGroupToTask;
+
+
+/***/ }),
 /* 883 */,
 /* 884 */
 /***/ (function(module) {
@@ -25512,7 +29493,7 @@ AWS.NodeHttpClient = AWS.util.inherit({
     }
 
     var useSSL = endpoint.protocol === 'https:';
-    var http = useSSL ? __webpack_require__(211) : __webpack_require__(876);
+    var http = useSSL ? __webpack_require__(211) : __webpack_require__(605);
     var options = {
       host: endpoint.hostname,
       port: endpoint.port,
@@ -25576,18 +29557,22 @@ AWS.NodeHttpClient = AWS.util.inherit({
       stream.abort();
     });
 
-    stream.on('error', function() {
+    stream.on('error', function(err) {
       if (connectTimeoutId) {
         clearTimeout(connectTimeoutId);
         connectTimeoutId = null;
       }
       if (stream.didCallback) return; stream.didCallback = true;
-      errCallback.apply(stream, arguments);
+      if ('ECONNRESET' === err.code || 'EPIPE' === err.code || 'ETIMEDOUT' === err.code) {
+        errCallback(AWS.util.error(err, {code: 'TimeoutError'}));
+      } else {
+        errCallback(err);
+      }
     });
 
     var expect = httpRequest.headers.Expect || httpRequest.headers.expect;
     if (expect === '100-continue') {
-      stream.on('continue', function() {
+      stream.once('continue', function() {
         self.writeBody(stream, httpRequest);
       });
     } else {
@@ -25634,7 +29619,7 @@ AWS.NodeHttpClient = AWS.util.inherit({
    * Create the https.Agent or http.Agent according to the request schema.
    */
   getAgent: function getAgent(useSSL, agentOptions) {
-    var http = useSSL ? __webpack_require__(211) : __webpack_require__(876);
+    var http = useSSL ? __webpack_require__(211) : __webpack_require__(605);
     if (useSSL) {
       if (!AWS.NodeHttpClient.sslAgent) {
         AWS.NodeHttpClient.sslAgent = new http.Agent(AWS.util.merge({
@@ -25719,32 +29704,150 @@ module.exports.iniLoader = new IniLoader();
 
 
 /***/ }),
-/* 893 */,
+/* 893 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _rng = _interopRequireDefault(__webpack_require__(844));
+
+var _bytesToUuid = _interopRequireDefault(__webpack_require__(390));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+// **`v1()` - Generate time-based UUID**
+//
+// Inspired by https://github.com/LiosK/UUID.js
+// and http://docs.python.org/library/uuid.html
+var _nodeId;
+
+var _clockseq; // Previous uuid creation time
+
+
+var _lastMSecs = 0;
+var _lastNSecs = 0; // See https://github.com/uuidjs/uuid for API details
+
+function v1(options, buf, offset) {
+  var i = buf && offset || 0;
+  var b = buf || [];
+  options = options || {};
+  var node = options.node || _nodeId;
+  var clockseq = options.clockseq !== undefined ? options.clockseq : _clockseq; // node and clockseq need to be initialized to random values if they're not
+  // specified.  We do this lazily to minimize issues related to insufficient
+  // system entropy.  See #189
+
+  if (node == null || clockseq == null) {
+    var seedBytes = options.random || (options.rng || _rng.default)();
+
+    if (node == null) {
+      // Per 4.5, create and 48-bit node id, (47 random bits + multicast bit = 1)
+      node = _nodeId = [seedBytes[0] | 0x01, seedBytes[1], seedBytes[2], seedBytes[3], seedBytes[4], seedBytes[5]];
+    }
+
+    if (clockseq == null) {
+      // Per 4.2.2, randomize (14 bit) clockseq
+      clockseq = _clockseq = (seedBytes[6] << 8 | seedBytes[7]) & 0x3fff;
+    }
+  } // UUID timestamps are 100 nano-second units since the Gregorian epoch,
+  // (1582-10-15 00:00).  JSNumbers aren't precise enough for this, so
+  // time is handled internally as 'msecs' (integer milliseconds) and 'nsecs'
+  // (100-nanoseconds offset from msecs) since unix epoch, 1970-01-01 00:00.
+
+
+  var msecs = options.msecs !== undefined ? options.msecs : new Date().getTime(); // Per 4.2.1.2, use count of uuid's generated during the current clock
+  // cycle to simulate higher resolution clock
+
+  var nsecs = options.nsecs !== undefined ? options.nsecs : _lastNSecs + 1; // Time since last uuid creation (in msecs)
+
+  var dt = msecs - _lastMSecs + (nsecs - _lastNSecs) / 10000; // Per 4.2.1.2, Bump clockseq on clock regression
+
+  if (dt < 0 && options.clockseq === undefined) {
+    clockseq = clockseq + 1 & 0x3fff;
+  } // Reset nsecs if clock regresses (new clockseq) or we've moved onto a new
+  // time interval
+
+
+  if ((dt < 0 || msecs > _lastMSecs) && options.nsecs === undefined) {
+    nsecs = 0;
+  } // Per 4.2.1.2 Throw error if too many uuids are requested
+
+
+  if (nsecs >= 10000) {
+    throw new Error("uuid.v1(): Can't create more than 10M uuids/sec");
+  }
+
+  _lastMSecs = msecs;
+  _lastNSecs = nsecs;
+  _clockseq = clockseq; // Per 4.1.4 - Convert from unix epoch to Gregorian epoch
+
+  msecs += 12219292800000; // `time_low`
+
+  var tl = ((msecs & 0xfffffff) * 10000 + nsecs) % 0x100000000;
+  b[i++] = tl >>> 24 & 0xff;
+  b[i++] = tl >>> 16 & 0xff;
+  b[i++] = tl >>> 8 & 0xff;
+  b[i++] = tl & 0xff; // `time_mid`
+
+  var tmh = msecs / 0x100000000 * 10000 & 0xfffffff;
+  b[i++] = tmh >>> 8 & 0xff;
+  b[i++] = tmh & 0xff; // `time_high_and_version`
+
+  b[i++] = tmh >>> 24 & 0xf | 0x10; // include version
+
+  b[i++] = tmh >>> 16 & 0xff; // `clock_seq_hi_and_reserved` (Per 4.2.2 - include variant)
+
+  b[i++] = clockseq >>> 8 | 0x80; // `clock_seq_low`
+
+  b[i++] = clockseq & 0xff; // `node`
+
+  for (var n = 0; n < 6; ++n) {
+    b[i + n] = node[n];
+  }
+
+  return buf ? buf : (0, _bytesToUuid.default)(b);
+}
+
+var _default = v1;
+exports.default = _default;
+
+/***/ }),
 /* 894 */,
 /* 895 */,
 /* 896 */,
 /* 897 */
 /***/ (function(module) {
 
-module.exports = {"version":"2.0","metadata":{"apiVersion":"2006-03-01","checksumFormat":"md5","endpointPrefix":"s3","globalEndpoint":"s3.amazonaws.com","protocol":"rest-xml","serviceAbbreviation":"Amazon S3","serviceFullName":"Amazon Simple Storage Service","serviceId":"S3","signatureVersion":"s3","uid":"s3-2006-03-01"},"operations":{"AbortMultipartUpload":{"http":{"method":"DELETE","requestUri":"/{Bucket}/{Key+}","responseCode":204},"input":{"type":"structure","required":["Bucket","Key","UploadId"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"UploadId":{"location":"querystring","locationName":"uploadId"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"}}},"output":{"type":"structure","members":{"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}}},"CompleteMultipartUpload":{"http":{"requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","Key","UploadId"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"MultipartUpload":{"locationName":"CompleteMultipartUpload","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","members":{"Parts":{"locationName":"Part","type":"list","member":{"type":"structure","members":{"ETag":{},"PartNumber":{"type":"integer"}}},"flattened":true}}},"UploadId":{"location":"querystring","locationName":"uploadId"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"}},"payload":"MultipartUpload"},"output":{"type":"structure","members":{"Location":{},"Bucket":{},"Key":{},"Expiration":{"location":"header","locationName":"x-amz-expiration"},"ETag":{},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"VersionId":{"location":"header","locationName":"x-amz-version-id"},"SSEKMSKeyId":{"shape":"Sj","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}}},"CopyObject":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","CopySource","Key"],"members":{"ACL":{"location":"header","locationName":"x-amz-acl"},"Bucket":{"location":"uri","locationName":"Bucket"},"CacheControl":{"location":"header","locationName":"Cache-Control"},"ContentDisposition":{"location":"header","locationName":"Content-Disposition"},"ContentEncoding":{"location":"header","locationName":"Content-Encoding"},"ContentLanguage":{"location":"header","locationName":"Content-Language"},"ContentType":{"location":"header","locationName":"Content-Type"},"CopySource":{"location":"header","locationName":"x-amz-copy-source"},"CopySourceIfMatch":{"location":"header","locationName":"x-amz-copy-source-if-match"},"CopySourceIfModifiedSince":{"location":"header","locationName":"x-amz-copy-source-if-modified-since","type":"timestamp"},"CopySourceIfNoneMatch":{"location":"header","locationName":"x-amz-copy-source-if-none-match"},"CopySourceIfUnmodifiedSince":{"location":"header","locationName":"x-amz-copy-source-if-unmodified-since","type":"timestamp"},"Expires":{"location":"header","locationName":"Expires","type":"timestamp"},"GrantFullControl":{"location":"header","locationName":"x-amz-grant-full-control"},"GrantRead":{"location":"header","locationName":"x-amz-grant-read"},"GrantReadACP":{"location":"header","locationName":"x-amz-grant-read-acp"},"GrantWriteACP":{"location":"header","locationName":"x-amz-grant-write-acp"},"Key":{"location":"uri","locationName":"Key"},"Metadata":{"shape":"S11","location":"headers","locationName":"x-amz-meta-"},"MetadataDirective":{"location":"header","locationName":"x-amz-metadata-directive"},"TaggingDirective":{"location":"header","locationName":"x-amz-tagging-directive"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"StorageClass":{"location":"header","locationName":"x-amz-storage-class"},"WebsiteRedirectLocation":{"location":"header","locationName":"x-amz-website-redirect-location"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"S19","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sj","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"SSEKMSEncryptionContext":{"shape":"S1b","location":"header","locationName":"x-amz-server-side-encryption-context"},"CopySourceSSECustomerAlgorithm":{"location":"header","locationName":"x-amz-copy-source-server-side-encryption-customer-algorithm"},"CopySourceSSECustomerKey":{"shape":"S1d","location":"header","locationName":"x-amz-copy-source-server-side-encryption-customer-key"},"CopySourceSSECustomerKeyMD5":{"location":"header","locationName":"x-amz-copy-source-server-side-encryption-customer-key-MD5"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"Tagging":{"location":"header","locationName":"x-amz-tagging"},"ObjectLockMode":{"location":"header","locationName":"x-amz-object-lock-mode"},"ObjectLockRetainUntilDate":{"shape":"S1h","location":"header","locationName":"x-amz-object-lock-retain-until-date"},"ObjectLockLegalHoldStatus":{"location":"header","locationName":"x-amz-object-lock-legal-hold"}}},"output":{"type":"structure","members":{"CopyObjectResult":{"type":"structure","members":{"ETag":{},"LastModified":{"type":"timestamp"}}},"Expiration":{"location":"header","locationName":"x-amz-expiration"},"CopySourceVersionId":{"location":"header","locationName":"x-amz-copy-source-version-id"},"VersionId":{"location":"header","locationName":"x-amz-version-id"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sj","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"SSEKMSEncryptionContext":{"shape":"S1b","location":"header","locationName":"x-amz-server-side-encryption-context"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}},"payload":"CopyObjectResult"},"alias":"PutObjectCopy"},"CreateBucket":{"http":{"method":"PUT","requestUri":"/{Bucket}"},"input":{"type":"structure","required":["Bucket"],"members":{"ACL":{"location":"header","locationName":"x-amz-acl"},"Bucket":{"location":"uri","locationName":"Bucket"},"CreateBucketConfiguration":{"locationName":"CreateBucketConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","members":{"LocationConstraint":{}}},"GrantFullControl":{"location":"header","locationName":"x-amz-grant-full-control"},"GrantRead":{"location":"header","locationName":"x-amz-grant-read"},"GrantReadACP":{"location":"header","locationName":"x-amz-grant-read-acp"},"GrantWrite":{"location":"header","locationName":"x-amz-grant-write"},"GrantWriteACP":{"location":"header","locationName":"x-amz-grant-write-acp"},"ObjectLockEnabledForBucket":{"location":"header","locationName":"x-amz-bucket-object-lock-enabled","type":"boolean"}},"payload":"CreateBucketConfiguration"},"output":{"type":"structure","members":{"Location":{"location":"header","locationName":"Location"}}},"alias":"PutBucket"},"CreateMultipartUpload":{"http":{"requestUri":"/{Bucket}/{Key+}?uploads"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"ACL":{"location":"header","locationName":"x-amz-acl"},"Bucket":{"location":"uri","locationName":"Bucket"},"CacheControl":{"location":"header","locationName":"Cache-Control"},"ContentDisposition":{"location":"header","locationName":"Content-Disposition"},"ContentEncoding":{"location":"header","locationName":"Content-Encoding"},"ContentLanguage":{"location":"header","locationName":"Content-Language"},"ContentType":{"location":"header","locationName":"Content-Type"},"Expires":{"location":"header","locationName":"Expires","type":"timestamp"},"GrantFullControl":{"location":"header","locationName":"x-amz-grant-full-control"},"GrantRead":{"location":"header","locationName":"x-amz-grant-read"},"GrantReadACP":{"location":"header","locationName":"x-amz-grant-read-acp"},"GrantWriteACP":{"location":"header","locationName":"x-amz-grant-write-acp"},"Key":{"location":"uri","locationName":"Key"},"Metadata":{"shape":"S11","location":"headers","locationName":"x-amz-meta-"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"StorageClass":{"location":"header","locationName":"x-amz-storage-class"},"WebsiteRedirectLocation":{"location":"header","locationName":"x-amz-website-redirect-location"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"S19","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sj","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"SSEKMSEncryptionContext":{"shape":"S1b","location":"header","locationName":"x-amz-server-side-encryption-context"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"Tagging":{"location":"header","locationName":"x-amz-tagging"},"ObjectLockMode":{"location":"header","locationName":"x-amz-object-lock-mode"},"ObjectLockRetainUntilDate":{"shape":"S1h","location":"header","locationName":"x-amz-object-lock-retain-until-date"},"ObjectLockLegalHoldStatus":{"location":"header","locationName":"x-amz-object-lock-legal-hold"}}},"output":{"type":"structure","members":{"AbortDate":{"location":"header","locationName":"x-amz-abort-date","type":"timestamp"},"AbortRuleId":{"location":"header","locationName":"x-amz-abort-rule-id"},"Bucket":{"locationName":"Bucket"},"Key":{},"UploadId":{},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sj","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"SSEKMSEncryptionContext":{"shape":"S1b","location":"header","locationName":"x-amz-server-side-encryption-context"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}},"alias":"InitiateMultipartUpload"},"DeleteBucket":{"http":{"method":"DELETE","requestUri":"/{Bucket}","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}}},"DeleteBucketAnalyticsConfiguration":{"http":{"method":"DELETE","requestUri":"/{Bucket}?analytics","responseCode":204},"input":{"type":"structure","required":["Bucket","Id"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"}}}},"DeleteBucketCors":{"http":{"method":"DELETE","requestUri":"/{Bucket}?cors","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}}},"DeleteBucketEncryption":{"http":{"method":"DELETE","requestUri":"/{Bucket}?encryption","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}}},"DeleteBucketInventoryConfiguration":{"http":{"method":"DELETE","requestUri":"/{Bucket}?inventory","responseCode":204},"input":{"type":"structure","required":["Bucket","Id"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"}}}},"DeleteBucketLifecycle":{"http":{"method":"DELETE","requestUri":"/{Bucket}?lifecycle","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}}},"DeleteBucketMetricsConfiguration":{"http":{"method":"DELETE","requestUri":"/{Bucket}?metrics","responseCode":204},"input":{"type":"structure","required":["Bucket","Id"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"}}}},"DeleteBucketPolicy":{"http":{"method":"DELETE","requestUri":"/{Bucket}?policy","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}}},"DeleteBucketReplication":{"http":{"method":"DELETE","requestUri":"/{Bucket}?replication","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}}},"DeleteBucketTagging":{"http":{"method":"DELETE","requestUri":"/{Bucket}?tagging","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}}},"DeleteBucketWebsite":{"http":{"method":"DELETE","requestUri":"/{Bucket}?website","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}}},"DeleteObject":{"http":{"method":"DELETE","requestUri":"/{Bucket}/{Key+}","responseCode":204},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"MFA":{"location":"header","locationName":"x-amz-mfa"},"VersionId":{"location":"querystring","locationName":"versionId"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"BypassGovernanceRetention":{"location":"header","locationName":"x-amz-bypass-governance-retention","type":"boolean"}}},"output":{"type":"structure","members":{"DeleteMarker":{"location":"header","locationName":"x-amz-delete-marker","type":"boolean"},"VersionId":{"location":"header","locationName":"x-amz-version-id"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}}},"DeleteObjectTagging":{"http":{"method":"DELETE","requestUri":"/{Bucket}/{Key+}?tagging","responseCode":204},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"}}},"output":{"type":"structure","members":{"VersionId":{"location":"header","locationName":"x-amz-version-id"}}}},"DeleteObjects":{"http":{"requestUri":"/{Bucket}?delete"},"input":{"type":"structure","required":["Bucket","Delete"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Delete":{"locationName":"Delete","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","required":["Objects"],"members":{"Objects":{"locationName":"Object","type":"list","member":{"type":"structure","required":["Key"],"members":{"Key":{},"VersionId":{}}},"flattened":true},"Quiet":{"type":"boolean"}}},"MFA":{"location":"header","locationName":"x-amz-mfa"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"BypassGovernanceRetention":{"location":"header","locationName":"x-amz-bypass-governance-retention","type":"boolean"}},"payload":"Delete"},"output":{"type":"structure","members":{"Deleted":{"type":"list","member":{"type":"structure","members":{"Key":{},"VersionId":{},"DeleteMarker":{"type":"boolean"},"DeleteMarkerVersionId":{}}},"flattened":true},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"},"Errors":{"locationName":"Error","type":"list","member":{"type":"structure","members":{"Key":{},"VersionId":{},"Code":{},"Message":{}}},"flattened":true}}},"alias":"DeleteMultipleObjects","httpChecksumRequired":true},"DeletePublicAccessBlock":{"http":{"method":"DELETE","requestUri":"/{Bucket}?publicAccessBlock","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}}},"GetBucketAccelerateConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?accelerate"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"Status":{}}}},"GetBucketAcl":{"http":{"method":"GET","requestUri":"/{Bucket}?acl"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"Owner":{"shape":"S32"},"Grants":{"shape":"S35","locationName":"AccessControlList"}}}},"GetBucketAnalyticsConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?analytics"},"input":{"type":"structure","required":["Bucket","Id"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"}}},"output":{"type":"structure","members":{"AnalyticsConfiguration":{"shape":"S3e"}},"payload":"AnalyticsConfiguration"}},"GetBucketCors":{"http":{"method":"GET","requestUri":"/{Bucket}?cors"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"CORSRules":{"shape":"S3u","locationName":"CORSRule"}}}},"GetBucketEncryption":{"http":{"method":"GET","requestUri":"/{Bucket}?encryption"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"ServerSideEncryptionConfiguration":{"shape":"S47"}},"payload":"ServerSideEncryptionConfiguration"}},"GetBucketInventoryConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?inventory"},"input":{"type":"structure","required":["Bucket","Id"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"}}},"output":{"type":"structure","members":{"InventoryConfiguration":{"shape":"S4d"}},"payload":"InventoryConfiguration"}},"GetBucketLifecycle":{"http":{"method":"GET","requestUri":"/{Bucket}?lifecycle"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"Rules":{"shape":"S4t","locationName":"Rule"}}},"deprecated":true},"GetBucketLifecycleConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?lifecycle"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"Rules":{"shape":"S58","locationName":"Rule"}}}},"GetBucketLocation":{"http":{"method":"GET","requestUri":"/{Bucket}?location"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"LocationConstraint":{}}}},"GetBucketLogging":{"http":{"method":"GET","requestUri":"/{Bucket}?logging"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"LoggingEnabled":{"shape":"S5i"}}}},"GetBucketMetricsConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?metrics"},"input":{"type":"structure","required":["Bucket","Id"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"}}},"output":{"type":"structure","members":{"MetricsConfiguration":{"shape":"S5q"}},"payload":"MetricsConfiguration"}},"GetBucketNotification":{"http":{"method":"GET","requestUri":"/{Bucket}?notification"},"input":{"shape":"S5t"},"output":{"shape":"S5u"},"deprecated":true},"GetBucketNotificationConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?notification"},"input":{"shape":"S5t"},"output":{"shape":"S65"}},"GetBucketPolicy":{"http":{"method":"GET","requestUri":"/{Bucket}?policy"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"Policy":{}},"payload":"Policy"}},"GetBucketPolicyStatus":{"http":{"method":"GET","requestUri":"/{Bucket}?policyStatus"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"PolicyStatus":{"type":"structure","members":{"IsPublic":{"locationName":"IsPublic","type":"boolean"}}}},"payload":"PolicyStatus"}},"GetBucketReplication":{"http":{"method":"GET","requestUri":"/{Bucket}?replication"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"ReplicationConfiguration":{"shape":"S6s"}},"payload":"ReplicationConfiguration"}},"GetBucketRequestPayment":{"http":{"method":"GET","requestUri":"/{Bucket}?requestPayment"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"Payer":{}}}},"GetBucketTagging":{"http":{"method":"GET","requestUri":"/{Bucket}?tagging"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","required":["TagSet"],"members":{"TagSet":{"shape":"S3k"}}}},"GetBucketVersioning":{"http":{"method":"GET","requestUri":"/{Bucket}?versioning"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"Status":{},"MFADelete":{"locationName":"MfaDelete"}}}},"GetBucketWebsite":{"http":{"method":"GET","requestUri":"/{Bucket}?website"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"RedirectAllRequestsTo":{"shape":"S7t"},"IndexDocument":{"shape":"S7w"},"ErrorDocument":{"shape":"S7y"},"RoutingRules":{"shape":"S7z"}}}},"GetObject":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"IfMatch":{"location":"header","locationName":"If-Match"},"IfModifiedSince":{"location":"header","locationName":"If-Modified-Since","type":"timestamp"},"IfNoneMatch":{"location":"header","locationName":"If-None-Match"},"IfUnmodifiedSince":{"location":"header","locationName":"If-Unmodified-Since","type":"timestamp"},"Key":{"location":"uri","locationName":"Key"},"Range":{"location":"header","locationName":"Range"},"ResponseCacheControl":{"location":"querystring","locationName":"response-cache-control"},"ResponseContentDisposition":{"location":"querystring","locationName":"response-content-disposition"},"ResponseContentEncoding":{"location":"querystring","locationName":"response-content-encoding"},"ResponseContentLanguage":{"location":"querystring","locationName":"response-content-language"},"ResponseContentType":{"location":"querystring","locationName":"response-content-type"},"ResponseExpires":{"location":"querystring","locationName":"response-expires","type":"timestamp"},"VersionId":{"location":"querystring","locationName":"versionId"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"S19","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"PartNumber":{"location":"querystring","locationName":"partNumber","type":"integer"}}},"output":{"type":"structure","members":{"Body":{"streaming":true,"type":"blob"},"DeleteMarker":{"location":"header","locationName":"x-amz-delete-marker","type":"boolean"},"AcceptRanges":{"location":"header","locationName":"accept-ranges"},"Expiration":{"location":"header","locationName":"x-amz-expiration"},"Restore":{"location":"header","locationName":"x-amz-restore"},"LastModified":{"location":"header","locationName":"Last-Modified","type":"timestamp"},"ContentLength":{"location":"header","locationName":"Content-Length","type":"long"},"ETag":{"location":"header","locationName":"ETag"},"MissingMeta":{"location":"header","locationName":"x-amz-missing-meta","type":"integer"},"VersionId":{"location":"header","locationName":"x-amz-version-id"},"CacheControl":{"location":"header","locationName":"Cache-Control"},"ContentDisposition":{"location":"header","locationName":"Content-Disposition"},"ContentEncoding":{"location":"header","locationName":"Content-Encoding"},"ContentLanguage":{"location":"header","locationName":"Content-Language"},"ContentRange":{"location":"header","locationName":"Content-Range"},"ContentType":{"location":"header","locationName":"Content-Type"},"Expires":{"location":"header","locationName":"Expires","type":"timestamp"},"WebsiteRedirectLocation":{"location":"header","locationName":"x-amz-website-redirect-location"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"Metadata":{"shape":"S11","location":"headers","locationName":"x-amz-meta-"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sj","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"StorageClass":{"location":"header","locationName":"x-amz-storage-class"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"},"ReplicationStatus":{"location":"header","locationName":"x-amz-replication-status"},"PartsCount":{"location":"header","locationName":"x-amz-mp-parts-count","type":"integer"},"TagCount":{"location":"header","locationName":"x-amz-tagging-count","type":"integer"},"ObjectLockMode":{"location":"header","locationName":"x-amz-object-lock-mode"},"ObjectLockRetainUntilDate":{"shape":"S1h","location":"header","locationName":"x-amz-object-lock-retain-until-date"},"ObjectLockLegalHoldStatus":{"location":"header","locationName":"x-amz-object-lock-legal-hold"}},"payload":"Body"}},"GetObjectAcl":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}?acl"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"}}},"output":{"type":"structure","members":{"Owner":{"shape":"S32"},"Grants":{"shape":"S35","locationName":"AccessControlList"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}}},"GetObjectLegalHold":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}?legal-hold"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"}}},"output":{"type":"structure","members":{"LegalHold":{"shape":"S8y"}},"payload":"LegalHold"}},"GetObjectLockConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?object-lock"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"ObjectLockConfiguration":{"shape":"S91"}},"payload":"ObjectLockConfiguration"}},"GetObjectRetention":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}?retention"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"}}},"output":{"type":"structure","members":{"Retention":{"shape":"S99"}},"payload":"Retention"}},"GetObjectTagging":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}?tagging"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"}}},"output":{"type":"structure","required":["TagSet"],"members":{"VersionId":{"location":"header","locationName":"x-amz-version-id"},"TagSet":{"shape":"S3k"}}}},"GetObjectTorrent":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}?torrent"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"}}},"output":{"type":"structure","members":{"Body":{"streaming":true,"type":"blob"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}},"payload":"Body"}},"GetPublicAccessBlock":{"http":{"method":"GET","requestUri":"/{Bucket}?publicAccessBlock"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"output":{"type":"structure","members":{"PublicAccessBlockConfiguration":{"shape":"S9g"}},"payload":"PublicAccessBlockConfiguration"}},"HeadBucket":{"http":{"method":"HEAD","requestUri":"/{Bucket}"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}}},"HeadObject":{"http":{"method":"HEAD","requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"IfMatch":{"location":"header","locationName":"If-Match"},"IfModifiedSince":{"location":"header","locationName":"If-Modified-Since","type":"timestamp"},"IfNoneMatch":{"location":"header","locationName":"If-None-Match"},"IfUnmodifiedSince":{"location":"header","locationName":"If-Unmodified-Since","type":"timestamp"},"Key":{"location":"uri","locationName":"Key"},"Range":{"location":"header","locationName":"Range"},"VersionId":{"location":"querystring","locationName":"versionId"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"S19","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"PartNumber":{"location":"querystring","locationName":"partNumber","type":"integer"}}},"output":{"type":"structure","members":{"DeleteMarker":{"location":"header","locationName":"x-amz-delete-marker","type":"boolean"},"AcceptRanges":{"location":"header","locationName":"accept-ranges"},"Expiration":{"location":"header","locationName":"x-amz-expiration"},"Restore":{"location":"header","locationName":"x-amz-restore"},"LastModified":{"location":"header","locationName":"Last-Modified","type":"timestamp"},"ContentLength":{"location":"header","locationName":"Content-Length","type":"long"},"ETag":{"location":"header","locationName":"ETag"},"MissingMeta":{"location":"header","locationName":"x-amz-missing-meta","type":"integer"},"VersionId":{"location":"header","locationName":"x-amz-version-id"},"CacheControl":{"location":"header","locationName":"Cache-Control"},"ContentDisposition":{"location":"header","locationName":"Content-Disposition"},"ContentEncoding":{"location":"header","locationName":"Content-Encoding"},"ContentLanguage":{"location":"header","locationName":"Content-Language"},"ContentType":{"location":"header","locationName":"Content-Type"},"Expires":{"location":"header","locationName":"Expires","type":"timestamp"},"WebsiteRedirectLocation":{"location":"header","locationName":"x-amz-website-redirect-location"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"Metadata":{"shape":"S11","location":"headers","locationName":"x-amz-meta-"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sj","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"StorageClass":{"location":"header","locationName":"x-amz-storage-class"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"},"ReplicationStatus":{"location":"header","locationName":"x-amz-replication-status"},"PartsCount":{"location":"header","locationName":"x-amz-mp-parts-count","type":"integer"},"ObjectLockMode":{"location":"header","locationName":"x-amz-object-lock-mode"},"ObjectLockRetainUntilDate":{"shape":"S1h","location":"header","locationName":"x-amz-object-lock-retain-until-date"},"ObjectLockLegalHoldStatus":{"location":"header","locationName":"x-amz-object-lock-legal-hold"}}}},"ListBucketAnalyticsConfigurations":{"http":{"method":"GET","requestUri":"/{Bucket}?analytics"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"ContinuationToken":{"location":"querystring","locationName":"continuation-token"}}},"output":{"type":"structure","members":{"IsTruncated":{"type":"boolean"},"ContinuationToken":{},"NextContinuationToken":{},"AnalyticsConfigurationList":{"locationName":"AnalyticsConfiguration","type":"list","member":{"shape":"S3e"},"flattened":true}}}},"ListBucketInventoryConfigurations":{"http":{"method":"GET","requestUri":"/{Bucket}?inventory"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"ContinuationToken":{"location":"querystring","locationName":"continuation-token"}}},"output":{"type":"structure","members":{"ContinuationToken":{},"InventoryConfigurationList":{"locationName":"InventoryConfiguration","type":"list","member":{"shape":"S4d"},"flattened":true},"IsTruncated":{"type":"boolean"},"NextContinuationToken":{}}}},"ListBucketMetricsConfigurations":{"http":{"method":"GET","requestUri":"/{Bucket}?metrics"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"ContinuationToken":{"location":"querystring","locationName":"continuation-token"}}},"output":{"type":"structure","members":{"IsTruncated":{"type":"boolean"},"ContinuationToken":{},"NextContinuationToken":{},"MetricsConfigurationList":{"locationName":"MetricsConfiguration","type":"list","member":{"shape":"S5q"},"flattened":true}}}},"ListBuckets":{"http":{"method":"GET"},"output":{"type":"structure","members":{"Buckets":{"type":"list","member":{"locationName":"Bucket","type":"structure","members":{"Name":{},"CreationDate":{"type":"timestamp"}}}},"Owner":{"shape":"S32"}}},"alias":"GetService"},"ListMultipartUploads":{"http":{"method":"GET","requestUri":"/{Bucket}?uploads"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Delimiter":{"location":"querystring","locationName":"delimiter"},"EncodingType":{"location":"querystring","locationName":"encoding-type"},"KeyMarker":{"location":"querystring","locationName":"key-marker"},"MaxUploads":{"location":"querystring","locationName":"max-uploads","type":"integer"},"Prefix":{"location":"querystring","locationName":"prefix"},"UploadIdMarker":{"location":"querystring","locationName":"upload-id-marker"}}},"output":{"type":"structure","members":{"Bucket":{},"KeyMarker":{},"UploadIdMarker":{},"NextKeyMarker":{},"Prefix":{},"Delimiter":{},"NextUploadIdMarker":{},"MaxUploads":{"type":"integer"},"IsTruncated":{"type":"boolean"},"Uploads":{"locationName":"Upload","type":"list","member":{"type":"structure","members":{"UploadId":{},"Key":{},"Initiated":{"type":"timestamp"},"StorageClass":{},"Owner":{"shape":"S32"},"Initiator":{"shape":"Sad"}}},"flattened":true},"CommonPrefixes":{"shape":"Sae"},"EncodingType":{}}}},"ListObjectVersions":{"http":{"method":"GET","requestUri":"/{Bucket}?versions"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Delimiter":{"location":"querystring","locationName":"delimiter"},"EncodingType":{"location":"querystring","locationName":"encoding-type"},"KeyMarker":{"location":"querystring","locationName":"key-marker"},"MaxKeys":{"location":"querystring","locationName":"max-keys","type":"integer"},"Prefix":{"location":"querystring","locationName":"prefix"},"VersionIdMarker":{"location":"querystring","locationName":"version-id-marker"}}},"output":{"type":"structure","members":{"IsTruncated":{"type":"boolean"},"KeyMarker":{},"VersionIdMarker":{},"NextKeyMarker":{},"NextVersionIdMarker":{},"Versions":{"locationName":"Version","type":"list","member":{"type":"structure","members":{"ETag":{},"Size":{"type":"integer"},"StorageClass":{},"Key":{},"VersionId":{},"IsLatest":{"type":"boolean"},"LastModified":{"type":"timestamp"},"Owner":{"shape":"S32"}}},"flattened":true},"DeleteMarkers":{"locationName":"DeleteMarker","type":"list","member":{"type":"structure","members":{"Owner":{"shape":"S32"},"Key":{},"VersionId":{},"IsLatest":{"type":"boolean"},"LastModified":{"type":"timestamp"}}},"flattened":true},"Name":{},"Prefix":{},"Delimiter":{},"MaxKeys":{"type":"integer"},"CommonPrefixes":{"shape":"Sae"},"EncodingType":{}}},"alias":"GetBucketObjectVersions"},"ListObjects":{"http":{"method":"GET","requestUri":"/{Bucket}"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Delimiter":{"location":"querystring","locationName":"delimiter"},"EncodingType":{"location":"querystring","locationName":"encoding-type"},"Marker":{"location":"querystring","locationName":"marker"},"MaxKeys":{"location":"querystring","locationName":"max-keys","type":"integer"},"Prefix":{"location":"querystring","locationName":"prefix"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"}}},"output":{"type":"structure","members":{"IsTruncated":{"type":"boolean"},"Marker":{},"NextMarker":{},"Contents":{"shape":"Saw"},"Name":{},"Prefix":{},"Delimiter":{},"MaxKeys":{"type":"integer"},"CommonPrefixes":{"shape":"Sae"},"EncodingType":{}}},"alias":"GetBucket"},"ListObjectsV2":{"http":{"method":"GET","requestUri":"/{Bucket}?list-type=2"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Delimiter":{"location":"querystring","locationName":"delimiter"},"EncodingType":{"location":"querystring","locationName":"encoding-type"},"MaxKeys":{"location":"querystring","locationName":"max-keys","type":"integer"},"Prefix":{"location":"querystring","locationName":"prefix"},"ContinuationToken":{"location":"querystring","locationName":"continuation-token"},"FetchOwner":{"location":"querystring","locationName":"fetch-owner","type":"boolean"},"StartAfter":{"location":"querystring","locationName":"start-after"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"}}},"output":{"type":"structure","members":{"IsTruncated":{"type":"boolean"},"Contents":{"shape":"Saw"},"Name":{},"Prefix":{},"Delimiter":{},"MaxKeys":{"type":"integer"},"CommonPrefixes":{"shape":"Sae"},"EncodingType":{},"KeyCount":{"type":"integer"},"ContinuationToken":{},"NextContinuationToken":{},"StartAfter":{}}}},"ListParts":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","Key","UploadId"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"MaxParts":{"location":"querystring","locationName":"max-parts","type":"integer"},"PartNumberMarker":{"location":"querystring","locationName":"part-number-marker","type":"integer"},"UploadId":{"location":"querystring","locationName":"uploadId"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"}}},"output":{"type":"structure","members":{"AbortDate":{"location":"header","locationName":"x-amz-abort-date","type":"timestamp"},"AbortRuleId":{"location":"header","locationName":"x-amz-abort-rule-id"},"Bucket":{},"Key":{},"UploadId":{},"PartNumberMarker":{"type":"integer"},"NextPartNumberMarker":{"type":"integer"},"MaxParts":{"type":"integer"},"IsTruncated":{"type":"boolean"},"Parts":{"locationName":"Part","type":"list","member":{"type":"structure","members":{"PartNumber":{"type":"integer"},"LastModified":{"type":"timestamp"},"ETag":{},"Size":{"type":"integer"}}},"flattened":true},"Initiator":{"shape":"Sad"},"Owner":{"shape":"S32"},"StorageClass":{},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}}},"PutBucketAccelerateConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?accelerate"},"input":{"type":"structure","required":["Bucket","AccelerateConfiguration"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"AccelerateConfiguration":{"locationName":"AccelerateConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","members":{"Status":{}}}},"payload":"AccelerateConfiguration"}},"PutBucketAcl":{"http":{"method":"PUT","requestUri":"/{Bucket}?acl"},"input":{"type":"structure","required":["Bucket"],"members":{"ACL":{"location":"header","locationName":"x-amz-acl"},"AccessControlPolicy":{"shape":"Sbe","locationName":"AccessControlPolicy","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"Bucket":{"location":"uri","locationName":"Bucket"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"},"GrantFullControl":{"location":"header","locationName":"x-amz-grant-full-control"},"GrantRead":{"location":"header","locationName":"x-amz-grant-read"},"GrantReadACP":{"location":"header","locationName":"x-amz-grant-read-acp"},"GrantWrite":{"location":"header","locationName":"x-amz-grant-write"},"GrantWriteACP":{"location":"header","locationName":"x-amz-grant-write-acp"}},"payload":"AccessControlPolicy"},"httpChecksumRequired":true},"PutBucketAnalyticsConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?analytics"},"input":{"type":"structure","required":["Bucket","Id","AnalyticsConfiguration"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"},"AnalyticsConfiguration":{"shape":"S3e","locationName":"AnalyticsConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}}},"payload":"AnalyticsConfiguration"}},"PutBucketCors":{"http":{"method":"PUT","requestUri":"/{Bucket}?cors"},"input":{"type":"structure","required":["Bucket","CORSConfiguration"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"CORSConfiguration":{"locationName":"CORSConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","required":["CORSRules"],"members":{"CORSRules":{"shape":"S3u","locationName":"CORSRule"}}},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"}},"payload":"CORSConfiguration"},"httpChecksumRequired":true},"PutBucketEncryption":{"http":{"method":"PUT","requestUri":"/{Bucket}?encryption"},"input":{"type":"structure","required":["Bucket","ServerSideEncryptionConfiguration"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"},"ServerSideEncryptionConfiguration":{"shape":"S47","locationName":"ServerSideEncryptionConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}}},"payload":"ServerSideEncryptionConfiguration"},"httpChecksumRequired":true},"PutBucketInventoryConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?inventory"},"input":{"type":"structure","required":["Bucket","Id","InventoryConfiguration"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"},"InventoryConfiguration":{"shape":"S4d","locationName":"InventoryConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}}},"payload":"InventoryConfiguration"}},"PutBucketLifecycle":{"http":{"method":"PUT","requestUri":"/{Bucket}?lifecycle"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"},"LifecycleConfiguration":{"locationName":"LifecycleConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","required":["Rules"],"members":{"Rules":{"shape":"S4t","locationName":"Rule"}}}},"payload":"LifecycleConfiguration"},"deprecated":true,"httpChecksumRequired":true},"PutBucketLifecycleConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?lifecycle"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"LifecycleConfiguration":{"locationName":"LifecycleConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","required":["Rules"],"members":{"Rules":{"shape":"S58","locationName":"Rule"}}}},"payload":"LifecycleConfiguration"},"httpChecksumRequired":true},"PutBucketLogging":{"http":{"method":"PUT","requestUri":"/{Bucket}?logging"},"input":{"type":"structure","required":["Bucket","BucketLoggingStatus"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"BucketLoggingStatus":{"locationName":"BucketLoggingStatus","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","members":{"LoggingEnabled":{"shape":"S5i"}}},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"}},"payload":"BucketLoggingStatus"},"httpChecksumRequired":true},"PutBucketMetricsConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?metrics"},"input":{"type":"structure","required":["Bucket","Id","MetricsConfiguration"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"},"MetricsConfiguration":{"shape":"S5q","locationName":"MetricsConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}}},"payload":"MetricsConfiguration"}},"PutBucketNotification":{"http":{"method":"PUT","requestUri":"/{Bucket}?notification"},"input":{"type":"structure","required":["Bucket","NotificationConfiguration"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"},"NotificationConfiguration":{"shape":"S5u","locationName":"NotificationConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}}},"payload":"NotificationConfiguration"},"deprecated":true,"httpChecksumRequired":true},"PutBucketNotificationConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?notification"},"input":{"type":"structure","required":["Bucket","NotificationConfiguration"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"NotificationConfiguration":{"shape":"S65","locationName":"NotificationConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}}},"payload":"NotificationConfiguration"}},"PutBucketPolicy":{"http":{"method":"PUT","requestUri":"/{Bucket}?policy"},"input":{"type":"structure","required":["Bucket","Policy"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"},"ConfirmRemoveSelfBucketAccess":{"location":"header","locationName":"x-amz-confirm-remove-self-bucket-access","type":"boolean"},"Policy":{}},"payload":"Policy"},"httpChecksumRequired":true},"PutBucketReplication":{"http":{"method":"PUT","requestUri":"/{Bucket}?replication"},"input":{"type":"structure","required":["Bucket","ReplicationConfiguration"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"},"ReplicationConfiguration":{"shape":"S6s","locationName":"ReplicationConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"Token":{"location":"header","locationName":"x-amz-bucket-object-lock-token"}},"payload":"ReplicationConfiguration"},"httpChecksumRequired":true},"PutBucketRequestPayment":{"http":{"method":"PUT","requestUri":"/{Bucket}?requestPayment"},"input":{"type":"structure","required":["Bucket","RequestPaymentConfiguration"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"},"RequestPaymentConfiguration":{"locationName":"RequestPaymentConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","required":["Payer"],"members":{"Payer":{}}}},"payload":"RequestPaymentConfiguration"},"httpChecksumRequired":true},"PutBucketTagging":{"http":{"method":"PUT","requestUri":"/{Bucket}?tagging"},"input":{"type":"structure","required":["Bucket","Tagging"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"},"Tagging":{"shape":"Sc1","locationName":"Tagging","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}}},"payload":"Tagging"},"httpChecksumRequired":true},"PutBucketVersioning":{"http":{"method":"PUT","requestUri":"/{Bucket}?versioning"},"input":{"type":"structure","required":["Bucket","VersioningConfiguration"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"},"MFA":{"location":"header","locationName":"x-amz-mfa"},"VersioningConfiguration":{"locationName":"VersioningConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","members":{"MFADelete":{"locationName":"MfaDelete"},"Status":{}}}},"payload":"VersioningConfiguration"},"httpChecksumRequired":true},"PutBucketWebsite":{"http":{"method":"PUT","requestUri":"/{Bucket}?website"},"input":{"type":"structure","required":["Bucket","WebsiteConfiguration"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"},"WebsiteConfiguration":{"locationName":"WebsiteConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","members":{"ErrorDocument":{"shape":"S7y"},"IndexDocument":{"shape":"S7w"},"RedirectAllRequestsTo":{"shape":"S7t"},"RoutingRules":{"shape":"S7z"}}}},"payload":"WebsiteConfiguration"},"httpChecksumRequired":true},"PutObject":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"ACL":{"location":"header","locationName":"x-amz-acl"},"Body":{"streaming":true,"type":"blob"},"Bucket":{"location":"uri","locationName":"Bucket"},"CacheControl":{"location":"header","locationName":"Cache-Control"},"ContentDisposition":{"location":"header","locationName":"Content-Disposition"},"ContentEncoding":{"location":"header","locationName":"Content-Encoding"},"ContentLanguage":{"location":"header","locationName":"Content-Language"},"ContentLength":{"location":"header","locationName":"Content-Length","type":"long"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ContentType":{"location":"header","locationName":"Content-Type"},"Expires":{"location":"header","locationName":"Expires","type":"timestamp"},"GrantFullControl":{"location":"header","locationName":"x-amz-grant-full-control"},"GrantRead":{"location":"header","locationName":"x-amz-grant-read"},"GrantReadACP":{"location":"header","locationName":"x-amz-grant-read-acp"},"GrantWriteACP":{"location":"header","locationName":"x-amz-grant-write-acp"},"Key":{"location":"uri","locationName":"Key"},"Metadata":{"shape":"S11","location":"headers","locationName":"x-amz-meta-"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"StorageClass":{"location":"header","locationName":"x-amz-storage-class"},"WebsiteRedirectLocation":{"location":"header","locationName":"x-amz-website-redirect-location"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"S19","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sj","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"SSEKMSEncryptionContext":{"shape":"S1b","location":"header","locationName":"x-amz-server-side-encryption-context"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"Tagging":{"location":"header","locationName":"x-amz-tagging"},"ObjectLockMode":{"location":"header","locationName":"x-amz-object-lock-mode"},"ObjectLockRetainUntilDate":{"shape":"S1h","location":"header","locationName":"x-amz-object-lock-retain-until-date"},"ObjectLockLegalHoldStatus":{"location":"header","locationName":"x-amz-object-lock-legal-hold"}},"payload":"Body"},"output":{"type":"structure","members":{"Expiration":{"location":"header","locationName":"x-amz-expiration"},"ETag":{"location":"header","locationName":"ETag"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"VersionId":{"location":"header","locationName":"x-amz-version-id"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sj","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"SSEKMSEncryptionContext":{"shape":"S1b","location":"header","locationName":"x-amz-server-side-encryption-context"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}}},"PutObjectAcl":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}?acl"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"ACL":{"location":"header","locationName":"x-amz-acl"},"AccessControlPolicy":{"shape":"Sbe","locationName":"AccessControlPolicy","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"Bucket":{"location":"uri","locationName":"Bucket"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"},"GrantFullControl":{"location":"header","locationName":"x-amz-grant-full-control"},"GrantRead":{"location":"header","locationName":"x-amz-grant-read"},"GrantReadACP":{"location":"header","locationName":"x-amz-grant-read-acp"},"GrantWrite":{"location":"header","locationName":"x-amz-grant-write"},"GrantWriteACP":{"location":"header","locationName":"x-amz-grant-write-acp"},"Key":{"location":"uri","locationName":"Key"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"VersionId":{"location":"querystring","locationName":"versionId"}},"payload":"AccessControlPolicy"},"output":{"type":"structure","members":{"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}},"httpChecksumRequired":true},"PutObjectLegalHold":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}?legal-hold"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"LegalHold":{"shape":"S8y","locationName":"LegalHold","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"VersionId":{"location":"querystring","locationName":"versionId"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"}},"payload":"LegalHold"},"output":{"type":"structure","members":{"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}},"httpChecksumRequired":true},"PutObjectLockConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?object-lock"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"ObjectLockConfiguration":{"shape":"S91","locationName":"ObjectLockConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"Token":{"location":"header","locationName":"x-amz-bucket-object-lock-token"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"}},"payload":"ObjectLockConfiguration"},"output":{"type":"structure","members":{"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}},"httpChecksumRequired":true},"PutObjectRetention":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}?retention"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"Retention":{"shape":"S99","locationName":"Retention","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"VersionId":{"location":"querystring","locationName":"versionId"},"BypassGovernanceRetention":{"location":"header","locationName":"x-amz-bypass-governance-retention","type":"boolean"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"}},"payload":"Retention"},"output":{"type":"structure","members":{"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}},"httpChecksumRequired":true},"PutObjectTagging":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}?tagging"},"input":{"type":"structure","required":["Bucket","Key","Tagging"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"},"Tagging":{"shape":"Sc1","locationName":"Tagging","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}}},"payload":"Tagging"},"output":{"type":"structure","members":{"VersionId":{"location":"header","locationName":"x-amz-version-id"}}},"httpChecksumRequired":true},"PutPublicAccessBlock":{"http":{"method":"PUT","requestUri":"/{Bucket}?publicAccessBlock"},"input":{"type":"structure","required":["Bucket","PublicAccessBlockConfiguration"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"ContentMD5":{"deprecated":true,"deprecatedMessage":"Content-MD5 header will now be automatically computed and injected in associated operation's Http request.","location":"header","locationName":"Content-MD5"},"PublicAccessBlockConfiguration":{"shape":"S9g","locationName":"PublicAccessBlockConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}}},"payload":"PublicAccessBlockConfiguration"},"httpChecksumRequired":true},"RestoreObject":{"http":{"requestUri":"/{Bucket}/{Key+}?restore"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"},"RestoreRequest":{"locationName":"RestoreRequest","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","members":{"Days":{"type":"integer"},"GlacierJobParameters":{"type":"structure","required":["Tier"],"members":{"Tier":{}}},"Type":{},"Tier":{},"Description":{},"SelectParameters":{"type":"structure","required":["InputSerialization","ExpressionType","Expression","OutputSerialization"],"members":{"InputSerialization":{"shape":"Scr"},"ExpressionType":{},"Expression":{},"OutputSerialization":{"shape":"Sd6"}}},"OutputLocation":{"type":"structure","members":{"S3":{"type":"structure","required":["BucketName","Prefix"],"members":{"BucketName":{},"Prefix":{},"Encryption":{"type":"structure","required":["EncryptionType"],"members":{"EncryptionType":{},"KMSKeyId":{"shape":"Sj"},"KMSContext":{}}},"CannedACL":{},"AccessControlList":{"shape":"S35"},"Tagging":{"shape":"Sc1"},"UserMetadata":{"type":"list","member":{"locationName":"MetadataEntry","type":"structure","members":{"Name":{},"Value":{}}}},"StorageClass":{}}}}}}},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"}},"payload":"RestoreRequest"},"output":{"type":"structure","members":{"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"},"RestoreOutputPath":{"location":"header","locationName":"x-amz-restore-output-path"}}},"alias":"PostObjectRestore"},"SelectObjectContent":{"http":{"requestUri":"/{Bucket}/{Key+}?select&select-type=2"},"input":{"locationName":"SelectObjectContentRequest","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","required":["Bucket","Key","Expression","ExpressionType","InputSerialization","OutputSerialization"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"S19","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"Expression":{},"ExpressionType":{},"RequestProgress":{"type":"structure","members":{"Enabled":{"type":"boolean"}}},"InputSerialization":{"shape":"Scr"},"OutputSerialization":{"shape":"Sd6"},"ScanRange":{"type":"structure","members":{"Start":{"type":"long"},"End":{"type":"long"}}}}},"output":{"type":"structure","members":{"Payload":{"type":"structure","members":{"Records":{"type":"structure","members":{"Payload":{"eventpayload":true,"type":"blob"}},"event":true},"Stats":{"type":"structure","members":{"Details":{"eventpayload":true,"type":"structure","members":{"BytesScanned":{"type":"long"},"BytesProcessed":{"type":"long"},"BytesReturned":{"type":"long"}}}},"event":true},"Progress":{"type":"structure","members":{"Details":{"eventpayload":true,"type":"structure","members":{"BytesScanned":{"type":"long"},"BytesProcessed":{"type":"long"},"BytesReturned":{"type":"long"}}}},"event":true},"Cont":{"type":"structure","members":{},"event":true},"End":{"type":"structure","members":{},"event":true}},"eventstream":true}},"payload":"Payload"}},"UploadPart":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","Key","PartNumber","UploadId"],"members":{"Body":{"streaming":true,"type":"blob"},"Bucket":{"location":"uri","locationName":"Bucket"},"ContentLength":{"location":"header","locationName":"Content-Length","type":"long"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"Key":{"location":"uri","locationName":"Key"},"PartNumber":{"location":"querystring","locationName":"partNumber","type":"integer"},"UploadId":{"location":"querystring","locationName":"uploadId"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"S19","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"}},"payload":"Body"},"output":{"type":"structure","members":{"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"ETag":{"location":"header","locationName":"ETag"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sj","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}}},"UploadPartCopy":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","CopySource","Key","PartNumber","UploadId"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"},"CopySource":{"location":"header","locationName":"x-amz-copy-source"},"CopySourceIfMatch":{"location":"header","locationName":"x-amz-copy-source-if-match"},"CopySourceIfModifiedSince":{"location":"header","locationName":"x-amz-copy-source-if-modified-since","type":"timestamp"},"CopySourceIfNoneMatch":{"location":"header","locationName":"x-amz-copy-source-if-none-match"},"CopySourceIfUnmodifiedSince":{"location":"header","locationName":"x-amz-copy-source-if-unmodified-since","type":"timestamp"},"CopySourceRange":{"location":"header","locationName":"x-amz-copy-source-range"},"Key":{"location":"uri","locationName":"Key"},"PartNumber":{"location":"querystring","locationName":"partNumber","type":"integer"},"UploadId":{"location":"querystring","locationName":"uploadId"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"S19","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"CopySourceSSECustomerAlgorithm":{"location":"header","locationName":"x-amz-copy-source-server-side-encryption-customer-algorithm"},"CopySourceSSECustomerKey":{"shape":"S1d","location":"header","locationName":"x-amz-copy-source-server-side-encryption-customer-key"},"CopySourceSSECustomerKeyMD5":{"location":"header","locationName":"x-amz-copy-source-server-side-encryption-customer-key-MD5"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"}}},"output":{"type":"structure","members":{"CopySourceVersionId":{"location":"header","locationName":"x-amz-copy-source-version-id"},"CopyPartResult":{"type":"structure","members":{"ETag":{},"LastModified":{"type":"timestamp"}}},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sj","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}},"payload":"CopyPartResult"}}},"shapes":{"Sj":{"type":"string","sensitive":true},"S11":{"type":"map","key":{},"value":{}},"S19":{"type":"blob","sensitive":true},"S1b":{"type":"string","sensitive":true},"S1d":{"type":"blob","sensitive":true},"S1h":{"type":"timestamp","timestampFormat":"iso8601"},"S32":{"type":"structure","members":{"DisplayName":{},"ID":{}}},"S35":{"type":"list","member":{"locationName":"Grant","type":"structure","members":{"Grantee":{"shape":"S37"},"Permission":{}}}},"S37":{"type":"structure","required":["Type"],"members":{"DisplayName":{},"EmailAddress":{},"ID":{},"Type":{"locationName":"xsi:type","xmlAttribute":true},"URI":{}},"xmlNamespace":{"prefix":"xsi","uri":"http://www.w3.org/2001/XMLSchema-instance"}},"S3e":{"type":"structure","required":["Id","StorageClassAnalysis"],"members":{"Id":{},"Filter":{"type":"structure","members":{"Prefix":{},"Tag":{"shape":"S3h"},"And":{"type":"structure","members":{"Prefix":{},"Tags":{"shape":"S3k","flattened":true,"locationName":"Tag"}}}}},"StorageClassAnalysis":{"type":"structure","members":{"DataExport":{"type":"structure","required":["OutputSchemaVersion","Destination"],"members":{"OutputSchemaVersion":{},"Destination":{"type":"structure","required":["S3BucketDestination"],"members":{"S3BucketDestination":{"type":"structure","required":["Format","Bucket"],"members":{"Format":{},"BucketAccountId":{},"Bucket":{},"Prefix":{}}}}}}}}}}},"S3h":{"type":"structure","required":["Key","Value"],"members":{"Key":{},"Value":{}}},"S3k":{"type":"list","member":{"shape":"S3h","locationName":"Tag"}},"S3u":{"type":"list","member":{"type":"structure","required":["AllowedMethods","AllowedOrigins"],"members":{"AllowedHeaders":{"locationName":"AllowedHeader","type":"list","member":{},"flattened":true},"AllowedMethods":{"locationName":"AllowedMethod","type":"list","member":{},"flattened":true},"AllowedOrigins":{"locationName":"AllowedOrigin","type":"list","member":{},"flattened":true},"ExposeHeaders":{"locationName":"ExposeHeader","type":"list","member":{},"flattened":true},"MaxAgeSeconds":{"type":"integer"}}},"flattened":true},"S47":{"type":"structure","required":["Rules"],"members":{"Rules":{"locationName":"Rule","type":"list","member":{"type":"structure","members":{"ApplyServerSideEncryptionByDefault":{"type":"structure","required":["SSEAlgorithm"],"members":{"SSEAlgorithm":{},"KMSMasterKeyID":{"shape":"Sj"}}}}},"flattened":true}}},"S4d":{"type":"structure","required":["Destination","IsEnabled","Id","IncludedObjectVersions","Schedule"],"members":{"Destination":{"type":"structure","required":["S3BucketDestination"],"members":{"S3BucketDestination":{"type":"structure","required":["Bucket","Format"],"members":{"AccountId":{},"Bucket":{},"Format":{},"Prefix":{},"Encryption":{"type":"structure","members":{"SSES3":{"locationName":"SSE-S3","type":"structure","members":{}},"SSEKMS":{"locationName":"SSE-KMS","type":"structure","required":["KeyId"],"members":{"KeyId":{"shape":"Sj"}}}}}}}}},"IsEnabled":{"type":"boolean"},"Filter":{"type":"structure","required":["Prefix"],"members":{"Prefix":{}}},"Id":{},"IncludedObjectVersions":{},"OptionalFields":{"type":"list","member":{"locationName":"Field"}},"Schedule":{"type":"structure","required":["Frequency"],"members":{"Frequency":{}}}}},"S4t":{"type":"list","member":{"type":"structure","required":["Prefix","Status"],"members":{"Expiration":{"shape":"S4v"},"ID":{},"Prefix":{},"Status":{},"Transition":{"shape":"S50"},"NoncurrentVersionTransition":{"shape":"S52"},"NoncurrentVersionExpiration":{"shape":"S53"},"AbortIncompleteMultipartUpload":{"shape":"S54"}}},"flattened":true},"S4v":{"type":"structure","members":{"Date":{"shape":"S4w"},"Days":{"type":"integer"},"ExpiredObjectDeleteMarker":{"type":"boolean"}}},"S4w":{"type":"timestamp","timestampFormat":"iso8601"},"S50":{"type":"structure","members":{"Date":{"shape":"S4w"},"Days":{"type":"integer"},"StorageClass":{}}},"S52":{"type":"structure","members":{"NoncurrentDays":{"type":"integer"},"StorageClass":{}}},"S53":{"type":"structure","members":{"NoncurrentDays":{"type":"integer"}}},"S54":{"type":"structure","members":{"DaysAfterInitiation":{"type":"integer"}}},"S58":{"type":"list","member":{"type":"structure","required":["Status"],"members":{"Expiration":{"shape":"S4v"},"ID":{},"Prefix":{"deprecated":true},"Filter":{"type":"structure","members":{"Prefix":{},"Tag":{"shape":"S3h"},"And":{"type":"structure","members":{"Prefix":{},"Tags":{"shape":"S3k","flattened":true,"locationName":"Tag"}}}}},"Status":{},"Transitions":{"locationName":"Transition","type":"list","member":{"shape":"S50"},"flattened":true},"NoncurrentVersionTransitions":{"locationName":"NoncurrentVersionTransition","type":"list","member":{"shape":"S52"},"flattened":true},"NoncurrentVersionExpiration":{"shape":"S53"},"AbortIncompleteMultipartUpload":{"shape":"S54"}}},"flattened":true},"S5i":{"type":"structure","required":["TargetBucket","TargetPrefix"],"members":{"TargetBucket":{},"TargetGrants":{"type":"list","member":{"locationName":"Grant","type":"structure","members":{"Grantee":{"shape":"S37"},"Permission":{}}}},"TargetPrefix":{}}},"S5q":{"type":"structure","required":["Id"],"members":{"Id":{},"Filter":{"type":"structure","members":{"Prefix":{},"Tag":{"shape":"S3h"},"And":{"type":"structure","members":{"Prefix":{},"Tags":{"shape":"S3k","flattened":true,"locationName":"Tag"}}}}}}},"S5t":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"location":"uri","locationName":"Bucket"}}},"S5u":{"type":"structure","members":{"TopicConfiguration":{"type":"structure","members":{"Id":{},"Events":{"shape":"S5x","locationName":"Event"},"Event":{"deprecated":true},"Topic":{}}},"QueueConfiguration":{"type":"structure","members":{"Id":{},"Event":{"deprecated":true},"Events":{"shape":"S5x","locationName":"Event"},"Queue":{}}},"CloudFunctionConfiguration":{"type":"structure","members":{"Id":{},"Event":{"deprecated":true},"Events":{"shape":"S5x","locationName":"Event"},"CloudFunction":{},"InvocationRole":{}}}}},"S5x":{"type":"list","member":{},"flattened":true},"S65":{"type":"structure","members":{"TopicConfigurations":{"locationName":"TopicConfiguration","type":"list","member":{"type":"structure","required":["TopicArn","Events"],"members":{"Id":{},"TopicArn":{"locationName":"Topic"},"Events":{"shape":"S5x","locationName":"Event"},"Filter":{"shape":"S68"}}},"flattened":true},"QueueConfigurations":{"locationName":"QueueConfiguration","type":"list","member":{"type":"structure","required":["QueueArn","Events"],"members":{"Id":{},"QueueArn":{"locationName":"Queue"},"Events":{"shape":"S5x","locationName":"Event"},"Filter":{"shape":"S68"}}},"flattened":true},"LambdaFunctionConfigurations":{"locationName":"CloudFunctionConfiguration","type":"list","member":{"type":"structure","required":["LambdaFunctionArn","Events"],"members":{"Id":{},"LambdaFunctionArn":{"locationName":"CloudFunction"},"Events":{"shape":"S5x","locationName":"Event"},"Filter":{"shape":"S68"}}},"flattened":true}}},"S68":{"type":"structure","members":{"Key":{"locationName":"S3Key","type":"structure","members":{"FilterRules":{"locationName":"FilterRule","type":"list","member":{"type":"structure","members":{"Name":{},"Value":{}}},"flattened":true}}}}},"S6s":{"type":"structure","required":["Role","Rules"],"members":{"Role":{},"Rules":{"locationName":"Rule","type":"list","member":{"type":"structure","required":["Status","Destination"],"members":{"ID":{},"Priority":{"type":"integer"},"Prefix":{"deprecated":true},"Filter":{"type":"structure","members":{"Prefix":{},"Tag":{"shape":"S3h"},"And":{"type":"structure","members":{"Prefix":{},"Tags":{"shape":"S3k","flattened":true,"locationName":"Tag"}}}}},"Status":{},"SourceSelectionCriteria":{"type":"structure","members":{"SseKmsEncryptedObjects":{"type":"structure","required":["Status"],"members":{"Status":{}}}}},"ExistingObjectReplication":{"type":"structure","required":["Status"],"members":{"Status":{}}},"Destination":{"type":"structure","required":["Bucket"],"members":{"Bucket":{},"Account":{},"StorageClass":{},"AccessControlTranslation":{"type":"structure","required":["Owner"],"members":{"Owner":{}}},"EncryptionConfiguration":{"type":"structure","members":{"ReplicaKmsKeyID":{}}},"ReplicationTime":{"type":"structure","required":["Status","Time"],"members":{"Status":{},"Time":{"shape":"S7c"}}},"Metrics":{"type":"structure","required":["Status","EventThreshold"],"members":{"Status":{},"EventThreshold":{"shape":"S7c"}}}}},"DeleteMarkerReplication":{"type":"structure","members":{"Status":{}}}}},"flattened":true}}},"S7c":{"type":"structure","members":{"Minutes":{"type":"integer"}}},"S7t":{"type":"structure","required":["HostName"],"members":{"HostName":{},"Protocol":{}}},"S7w":{"type":"structure","required":["Suffix"],"members":{"Suffix":{}}},"S7y":{"type":"structure","required":["Key"],"members":{"Key":{}}},"S7z":{"type":"list","member":{"locationName":"RoutingRule","type":"structure","required":["Redirect"],"members":{"Condition":{"type":"structure","members":{"HttpErrorCodeReturnedEquals":{},"KeyPrefixEquals":{}}},"Redirect":{"type":"structure","members":{"HostName":{},"HttpRedirectCode":{},"Protocol":{},"ReplaceKeyPrefixWith":{},"ReplaceKeyWith":{}}}}}},"S8y":{"type":"structure","members":{"Status":{}}},"S91":{"type":"structure","members":{"ObjectLockEnabled":{},"Rule":{"type":"structure","members":{"DefaultRetention":{"type":"structure","members":{"Mode":{},"Days":{"type":"integer"},"Years":{"type":"integer"}}}}}}},"S99":{"type":"structure","members":{"Mode":{},"RetainUntilDate":{"shape":"S4w"}}},"S9g":{"type":"structure","members":{"BlockPublicAcls":{"locationName":"BlockPublicAcls","type":"boolean"},"IgnorePublicAcls":{"locationName":"IgnorePublicAcls","type":"boolean"},"BlockPublicPolicy":{"locationName":"BlockPublicPolicy","type":"boolean"},"RestrictPublicBuckets":{"locationName":"RestrictPublicBuckets","type":"boolean"}}},"Sad":{"type":"structure","members":{"ID":{},"DisplayName":{}}},"Sae":{"type":"list","member":{"type":"structure","members":{"Prefix":{}}},"flattened":true},"Saw":{"type":"list","member":{"type":"structure","members":{"Key":{},"LastModified":{"type":"timestamp"},"ETag":{},"Size":{"type":"integer"},"StorageClass":{},"Owner":{"shape":"S32"}}},"flattened":true},"Sbe":{"type":"structure","members":{"Grants":{"shape":"S35","locationName":"AccessControlList"},"Owner":{"shape":"S32"}}},"Sc1":{"type":"structure","required":["TagSet"],"members":{"TagSet":{"shape":"S3k"}}},"Scr":{"type":"structure","members":{"CSV":{"type":"structure","members":{"FileHeaderInfo":{},"Comments":{},"QuoteEscapeCharacter":{},"RecordDelimiter":{},"FieldDelimiter":{},"QuoteCharacter":{},"AllowQuotedRecordDelimiter":{"type":"boolean"}}},"CompressionType":{},"JSON":{"type":"structure","members":{"Type":{}}},"Parquet":{"type":"structure","members":{}}}},"Sd6":{"type":"structure","members":{"CSV":{"type":"structure","members":{"QuoteFields":{},"QuoteEscapeCharacter":{},"RecordDelimiter":{},"FieldDelimiter":{},"QuoteCharacter":{}}},"JSON":{"type":"structure","members":{"RecordDelimiter":{}}}}}}};
+module.exports = {"version":"2.0","metadata":{"apiVersion":"2006-03-01","checksumFormat":"md5","endpointPrefix":"s3","globalEndpoint":"s3.amazonaws.com","protocol":"rest-xml","serviceAbbreviation":"Amazon S3","serviceFullName":"Amazon Simple Storage Service","serviceId":"S3","signatureVersion":"s3","uid":"s3-2006-03-01"},"operations":{"AbortMultipartUpload":{"http":{"method":"DELETE","requestUri":"/{Bucket}/{Key+}","responseCode":204},"input":{"type":"structure","required":["Bucket","Key","UploadId"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"UploadId":{"location":"querystring","locationName":"uploadId"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}}},"CompleteMultipartUpload":{"http":{"requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","Key","UploadId"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"MultipartUpload":{"locationName":"CompleteMultipartUpload","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","members":{"Parts":{"locationName":"Part","type":"list","member":{"type":"structure","members":{"ETag":{},"ChecksumCRC32":{},"ChecksumCRC32C":{},"ChecksumSHA1":{},"ChecksumSHA256":{},"PartNumber":{"type":"integer"}}},"flattened":true}}},"UploadId":{"location":"querystring","locationName":"uploadId"},"ChecksumCRC32":{"location":"header","locationName":"x-amz-checksum-crc32"},"ChecksumCRC32C":{"location":"header","locationName":"x-amz-checksum-crc32c"},"ChecksumSHA1":{"location":"header","locationName":"x-amz-checksum-sha1"},"ChecksumSHA256":{"location":"header","locationName":"x-amz-checksum-sha256"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"Sk","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"}},"payload":"MultipartUpload"},"output":{"type":"structure","members":{"Location":{},"Bucket":{},"Key":{},"Expiration":{"location":"header","locationName":"x-amz-expiration"},"ETag":{},"ChecksumCRC32":{},"ChecksumCRC32C":{},"ChecksumSHA1":{},"ChecksumSHA256":{},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"VersionId":{"location":"header","locationName":"x-amz-version-id"},"SSEKMSKeyId":{"shape":"Sr","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"BucketKeyEnabled":{"location":"header","locationName":"x-amz-server-side-encryption-bucket-key-enabled","type":"boolean"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}}},"CopyObject":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","CopySource","Key"],"members":{"ACL":{"location":"header","locationName":"x-amz-acl"},"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"CacheControl":{"location":"header","locationName":"Cache-Control"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-checksum-algorithm"},"ContentDisposition":{"location":"header","locationName":"Content-Disposition"},"ContentEncoding":{"location":"header","locationName":"Content-Encoding"},"ContentLanguage":{"location":"header","locationName":"Content-Language"},"ContentType":{"location":"header","locationName":"Content-Type"},"CopySource":{"location":"header","locationName":"x-amz-copy-source"},"CopySourceIfMatch":{"location":"header","locationName":"x-amz-copy-source-if-match"},"CopySourceIfModifiedSince":{"location":"header","locationName":"x-amz-copy-source-if-modified-since","type":"timestamp"},"CopySourceIfNoneMatch":{"location":"header","locationName":"x-amz-copy-source-if-none-match"},"CopySourceIfUnmodifiedSince":{"location":"header","locationName":"x-amz-copy-source-if-unmodified-since","type":"timestamp"},"Expires":{"location":"header","locationName":"Expires","type":"timestamp"},"GrantFullControl":{"location":"header","locationName":"x-amz-grant-full-control"},"GrantRead":{"location":"header","locationName":"x-amz-grant-read"},"GrantReadACP":{"location":"header","locationName":"x-amz-grant-read-acp"},"GrantWriteACP":{"location":"header","locationName":"x-amz-grant-write-acp"},"Key":{"location":"uri","locationName":"Key"},"Metadata":{"shape":"S1b","location":"headers","locationName":"x-amz-meta-"},"MetadataDirective":{"location":"header","locationName":"x-amz-metadata-directive"},"TaggingDirective":{"location":"header","locationName":"x-amz-tagging-directive"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"StorageClass":{"location":"header","locationName":"x-amz-storage-class"},"WebsiteRedirectLocation":{"location":"header","locationName":"x-amz-website-redirect-location"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"Sk","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sr","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"SSEKMSEncryptionContext":{"shape":"S1i","location":"header","locationName":"x-amz-server-side-encryption-context"},"BucketKeyEnabled":{"location":"header","locationName":"x-amz-server-side-encryption-bucket-key-enabled","type":"boolean"},"CopySourceSSECustomerAlgorithm":{"location":"header","locationName":"x-amz-copy-source-server-side-encryption-customer-algorithm"},"CopySourceSSECustomerKey":{"shape":"S1k","location":"header","locationName":"x-amz-copy-source-server-side-encryption-customer-key"},"CopySourceSSECustomerKeyMD5":{"location":"header","locationName":"x-amz-copy-source-server-side-encryption-customer-key-MD5"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"Tagging":{"location":"header","locationName":"x-amz-tagging"},"ObjectLockMode":{"location":"header","locationName":"x-amz-object-lock-mode"},"ObjectLockRetainUntilDate":{"shape":"S1o","location":"header","locationName":"x-amz-object-lock-retain-until-date"},"ObjectLockLegalHoldStatus":{"location":"header","locationName":"x-amz-object-lock-legal-hold"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"},"ExpectedSourceBucketOwner":{"location":"header","locationName":"x-amz-source-expected-bucket-owner"}}},"output":{"type":"structure","members":{"CopyObjectResult":{"type":"structure","members":{"ETag":{},"LastModified":{"type":"timestamp"},"ChecksumCRC32":{},"ChecksumCRC32C":{},"ChecksumSHA1":{},"ChecksumSHA256":{}}},"Expiration":{"location":"header","locationName":"x-amz-expiration"},"CopySourceVersionId":{"location":"header","locationName":"x-amz-copy-source-version-id"},"VersionId":{"location":"header","locationName":"x-amz-version-id"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sr","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"SSEKMSEncryptionContext":{"shape":"S1i","location":"header","locationName":"x-amz-server-side-encryption-context"},"BucketKeyEnabled":{"location":"header","locationName":"x-amz-server-side-encryption-bucket-key-enabled","type":"boolean"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}},"payload":"CopyObjectResult"},"alias":"PutObjectCopy"},"CreateBucket":{"http":{"method":"PUT","requestUri":"/{Bucket}"},"input":{"type":"structure","required":["Bucket"],"members":{"ACL":{"location":"header","locationName":"x-amz-acl"},"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"CreateBucketConfiguration":{"locationName":"CreateBucketConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","members":{"LocationConstraint":{}}},"GrantFullControl":{"location":"header","locationName":"x-amz-grant-full-control"},"GrantRead":{"location":"header","locationName":"x-amz-grant-read"},"GrantReadACP":{"location":"header","locationName":"x-amz-grant-read-acp"},"GrantWrite":{"location":"header","locationName":"x-amz-grant-write"},"GrantWriteACP":{"location":"header","locationName":"x-amz-grant-write-acp"},"ObjectLockEnabledForBucket":{"location":"header","locationName":"x-amz-bucket-object-lock-enabled","type":"boolean"},"ObjectOwnership":{"location":"header","locationName":"x-amz-object-ownership"}},"payload":"CreateBucketConfiguration"},"output":{"type":"structure","members":{"Location":{"location":"header","locationName":"Location"}}},"alias":"PutBucket","staticContextParams":{"DisableAccessPoints":{"value":true}}},"CreateMultipartUpload":{"http":{"requestUri":"/{Bucket}/{Key+}?uploads"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"ACL":{"location":"header","locationName":"x-amz-acl"},"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"CacheControl":{"location":"header","locationName":"Cache-Control"},"ContentDisposition":{"location":"header","locationName":"Content-Disposition"},"ContentEncoding":{"location":"header","locationName":"Content-Encoding"},"ContentLanguage":{"location":"header","locationName":"Content-Language"},"ContentType":{"location":"header","locationName":"Content-Type"},"Expires":{"location":"header","locationName":"Expires","type":"timestamp"},"GrantFullControl":{"location":"header","locationName":"x-amz-grant-full-control"},"GrantRead":{"location":"header","locationName":"x-amz-grant-read"},"GrantReadACP":{"location":"header","locationName":"x-amz-grant-read-acp"},"GrantWriteACP":{"location":"header","locationName":"x-amz-grant-write-acp"},"Key":{"location":"uri","locationName":"Key"},"Metadata":{"shape":"S1b","location":"headers","locationName":"x-amz-meta-"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"StorageClass":{"location":"header","locationName":"x-amz-storage-class"},"WebsiteRedirectLocation":{"location":"header","locationName":"x-amz-website-redirect-location"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"Sk","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sr","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"SSEKMSEncryptionContext":{"shape":"S1i","location":"header","locationName":"x-amz-server-side-encryption-context"},"BucketKeyEnabled":{"location":"header","locationName":"x-amz-server-side-encryption-bucket-key-enabled","type":"boolean"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"Tagging":{"location":"header","locationName":"x-amz-tagging"},"ObjectLockMode":{"location":"header","locationName":"x-amz-object-lock-mode"},"ObjectLockRetainUntilDate":{"shape":"S1o","location":"header","locationName":"x-amz-object-lock-retain-until-date"},"ObjectLockLegalHoldStatus":{"location":"header","locationName":"x-amz-object-lock-legal-hold"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-checksum-algorithm"}}},"output":{"type":"structure","members":{"AbortDate":{"location":"header","locationName":"x-amz-abort-date","type":"timestamp"},"AbortRuleId":{"location":"header","locationName":"x-amz-abort-rule-id"},"Bucket":{"locationName":"Bucket"},"Key":{},"UploadId":{},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sr","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"SSEKMSEncryptionContext":{"shape":"S1i","location":"header","locationName":"x-amz-server-side-encryption-context"},"BucketKeyEnabled":{"location":"header","locationName":"x-amz-server-side-encryption-bucket-key-enabled","type":"boolean"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-checksum-algorithm"}}},"alias":"InitiateMultipartUpload"},"DeleteBucket":{"http":{"method":"DELETE","requestUri":"/{Bucket}","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}}},"DeleteBucketAnalyticsConfiguration":{"http":{"method":"DELETE","requestUri":"/{Bucket}?analytics","responseCode":204},"input":{"type":"structure","required":["Bucket","Id"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}}},"DeleteBucketCors":{"http":{"method":"DELETE","requestUri":"/{Bucket}?cors","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}}},"DeleteBucketEncryption":{"http":{"method":"DELETE","requestUri":"/{Bucket}?encryption","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}}},"DeleteBucketIntelligentTieringConfiguration":{"http":{"method":"DELETE","requestUri":"/{Bucket}?intelligent-tiering","responseCode":204},"input":{"type":"structure","required":["Bucket","Id"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"}}}},"DeleteBucketInventoryConfiguration":{"http":{"method":"DELETE","requestUri":"/{Bucket}?inventory","responseCode":204},"input":{"type":"structure","required":["Bucket","Id"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}}},"DeleteBucketLifecycle":{"http":{"method":"DELETE","requestUri":"/{Bucket}?lifecycle","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}}},"DeleteBucketMetricsConfiguration":{"http":{"method":"DELETE","requestUri":"/{Bucket}?metrics","responseCode":204},"input":{"type":"structure","required":["Bucket","Id"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}}},"DeleteBucketOwnershipControls":{"http":{"method":"DELETE","requestUri":"/{Bucket}?ownershipControls","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}}},"DeleteBucketPolicy":{"http":{"method":"DELETE","requestUri":"/{Bucket}?policy","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}}},"DeleteBucketReplication":{"http":{"method":"DELETE","requestUri":"/{Bucket}?replication","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}}},"DeleteBucketTagging":{"http":{"method":"DELETE","requestUri":"/{Bucket}?tagging","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}}},"DeleteBucketWebsite":{"http":{"method":"DELETE","requestUri":"/{Bucket}?website","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}}},"DeleteObject":{"http":{"method":"DELETE","requestUri":"/{Bucket}/{Key+}","responseCode":204},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"MFA":{"location":"header","locationName":"x-amz-mfa"},"VersionId":{"location":"querystring","locationName":"versionId"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"BypassGovernanceRetention":{"location":"header","locationName":"x-amz-bypass-governance-retention","type":"boolean"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"DeleteMarker":{"location":"header","locationName":"x-amz-delete-marker","type":"boolean"},"VersionId":{"location":"header","locationName":"x-amz-version-id"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}}},"DeleteObjectTagging":{"http":{"method":"DELETE","requestUri":"/{Bucket}/{Key+}?tagging","responseCode":204},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"VersionId":{"location":"header","locationName":"x-amz-version-id"}}}},"DeleteObjects":{"http":{"requestUri":"/{Bucket}?delete"},"input":{"type":"structure","required":["Bucket","Delete"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Delete":{"locationName":"Delete","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","required":["Objects"],"members":{"Objects":{"locationName":"Object","type":"list","member":{"type":"structure","required":["Key"],"members":{"Key":{},"VersionId":{}}},"flattened":true},"Quiet":{"type":"boolean"}}},"MFA":{"location":"header","locationName":"x-amz-mfa"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"BypassGovernanceRetention":{"location":"header","locationName":"x-amz-bypass-governance-retention","type":"boolean"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"}},"payload":"Delete"},"output":{"type":"structure","members":{"Deleted":{"type":"list","member":{"type":"structure","members":{"Key":{},"VersionId":{},"DeleteMarker":{"type":"boolean"},"DeleteMarkerVersionId":{}}},"flattened":true},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"},"Errors":{"locationName":"Error","type":"list","member":{"type":"structure","members":{"Key":{},"VersionId":{},"Code":{},"Message":{}}},"flattened":true}}},"alias":"DeleteMultipleObjects","httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"DeletePublicAccessBlock":{"http":{"method":"DELETE","requestUri":"/{Bucket}?publicAccessBlock","responseCode":204},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}}},"GetBucketAccelerateConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?accelerate"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"Status":{}}}},"GetBucketAcl":{"http":{"method":"GET","requestUri":"/{Bucket}?acl"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"Owner":{"shape":"S3d"},"Grants":{"shape":"S3g","locationName":"AccessControlList"}}}},"GetBucketAnalyticsConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?analytics"},"input":{"type":"structure","required":["Bucket","Id"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"AnalyticsConfiguration":{"shape":"S3p"}},"payload":"AnalyticsConfiguration"}},"GetBucketCors":{"http":{"method":"GET","requestUri":"/{Bucket}?cors"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"CORSRules":{"shape":"S44","locationName":"CORSRule"}}}},"GetBucketEncryption":{"http":{"method":"GET","requestUri":"/{Bucket}?encryption"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"ServerSideEncryptionConfiguration":{"shape":"S4h"}},"payload":"ServerSideEncryptionConfiguration"}},"GetBucketIntelligentTieringConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?intelligent-tiering"},"input":{"type":"structure","required":["Bucket","Id"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"}}},"output":{"type":"structure","members":{"IntelligentTieringConfiguration":{"shape":"S4n"}},"payload":"IntelligentTieringConfiguration"}},"GetBucketInventoryConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?inventory"},"input":{"type":"structure","required":["Bucket","Id"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"InventoryConfiguration":{"shape":"S4x"}},"payload":"InventoryConfiguration"}},"GetBucketLifecycle":{"http":{"method":"GET","requestUri":"/{Bucket}?lifecycle"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"Rules":{"shape":"S5d","locationName":"Rule"}}},"deprecated":true},"GetBucketLifecycleConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?lifecycle"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"Rules":{"shape":"S5t","locationName":"Rule"}}}},"GetBucketLocation":{"http":{"method":"GET","requestUri":"/{Bucket}?location"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"LocationConstraint":{}}}},"GetBucketLogging":{"http":{"method":"GET","requestUri":"/{Bucket}?logging"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"LoggingEnabled":{"shape":"S65"}}}},"GetBucketMetricsConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?metrics"},"input":{"type":"structure","required":["Bucket","Id"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"MetricsConfiguration":{"shape":"S6d"}},"payload":"MetricsConfiguration"}},"GetBucketNotification":{"http":{"method":"GET","requestUri":"/{Bucket}?notification"},"input":{"shape":"S6h"},"output":{"shape":"S6i"},"deprecated":true},"GetBucketNotificationConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?notification"},"input":{"shape":"S6h"},"output":{"shape":"S6t"}},"GetBucketOwnershipControls":{"http":{"method":"GET","requestUri":"/{Bucket}?ownershipControls"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"OwnershipControls":{"shape":"S7a"}},"payload":"OwnershipControls"}},"GetBucketPolicy":{"http":{"method":"GET","requestUri":"/{Bucket}?policy"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"Policy":{}},"payload":"Policy"}},"GetBucketPolicyStatus":{"http":{"method":"GET","requestUri":"/{Bucket}?policyStatus"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"PolicyStatus":{"type":"structure","members":{"IsPublic":{"locationName":"IsPublic","type":"boolean"}}}},"payload":"PolicyStatus"}},"GetBucketReplication":{"http":{"method":"GET","requestUri":"/{Bucket}?replication"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"ReplicationConfiguration":{"shape":"S7m"}},"payload":"ReplicationConfiguration"}},"GetBucketRequestPayment":{"http":{"method":"GET","requestUri":"/{Bucket}?requestPayment"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"Payer":{}}}},"GetBucketTagging":{"http":{"method":"GET","requestUri":"/{Bucket}?tagging"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","required":["TagSet"],"members":{"TagSet":{"shape":"S3v"}}}},"GetBucketVersioning":{"http":{"method":"GET","requestUri":"/{Bucket}?versioning"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"Status":{},"MFADelete":{"locationName":"MfaDelete"}}}},"GetBucketWebsite":{"http":{"method":"GET","requestUri":"/{Bucket}?website"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"RedirectAllRequestsTo":{"shape":"S8p"},"IndexDocument":{"shape":"S8s"},"ErrorDocument":{"shape":"S8u"},"RoutingRules":{"shape":"S8v"}}}},"GetObject":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"IfMatch":{"location":"header","locationName":"If-Match"},"IfModifiedSince":{"location":"header","locationName":"If-Modified-Since","type":"timestamp"},"IfNoneMatch":{"location":"header","locationName":"If-None-Match"},"IfUnmodifiedSince":{"location":"header","locationName":"If-Unmodified-Since","type":"timestamp"},"Key":{"location":"uri","locationName":"Key"},"Range":{"location":"header","locationName":"Range"},"ResponseCacheControl":{"location":"querystring","locationName":"response-cache-control"},"ResponseContentDisposition":{"location":"querystring","locationName":"response-content-disposition"},"ResponseContentEncoding":{"location":"querystring","locationName":"response-content-encoding"},"ResponseContentLanguage":{"location":"querystring","locationName":"response-content-language"},"ResponseContentType":{"location":"querystring","locationName":"response-content-type"},"ResponseExpires":{"location":"querystring","locationName":"response-expires","type":"timestamp","timestampFormat":"rfc822"},"VersionId":{"location":"querystring","locationName":"versionId"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"Sk","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"PartNumber":{"location":"querystring","locationName":"partNumber","type":"integer"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"},"ChecksumMode":{"location":"header","locationName":"x-amz-checksum-mode"}}},"output":{"type":"structure","members":{"Body":{"streaming":true,"type":"blob"},"DeleteMarker":{"location":"header","locationName":"x-amz-delete-marker","type":"boolean"},"AcceptRanges":{"location":"header","locationName":"accept-ranges"},"Expiration":{"location":"header","locationName":"x-amz-expiration"},"Restore":{"location":"header","locationName":"x-amz-restore"},"LastModified":{"location":"header","locationName":"Last-Modified","type":"timestamp"},"ContentLength":{"location":"header","locationName":"Content-Length","type":"long"},"ETag":{"location":"header","locationName":"ETag"},"ChecksumCRC32":{"location":"header","locationName":"x-amz-checksum-crc32"},"ChecksumCRC32C":{"location":"header","locationName":"x-amz-checksum-crc32c"},"ChecksumSHA1":{"location":"header","locationName":"x-amz-checksum-sha1"},"ChecksumSHA256":{"location":"header","locationName":"x-amz-checksum-sha256"},"MissingMeta":{"location":"header","locationName":"x-amz-missing-meta","type":"integer"},"VersionId":{"location":"header","locationName":"x-amz-version-id"},"CacheControl":{"location":"header","locationName":"Cache-Control"},"ContentDisposition":{"location":"header","locationName":"Content-Disposition"},"ContentEncoding":{"location":"header","locationName":"Content-Encoding"},"ContentLanguage":{"location":"header","locationName":"Content-Language"},"ContentRange":{"location":"header","locationName":"Content-Range"},"ContentType":{"location":"header","locationName":"Content-Type"},"Expires":{"location":"header","locationName":"Expires","type":"timestamp"},"WebsiteRedirectLocation":{"location":"header","locationName":"x-amz-website-redirect-location"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"Metadata":{"shape":"S1b","location":"headers","locationName":"x-amz-meta-"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sr","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"BucketKeyEnabled":{"location":"header","locationName":"x-amz-server-side-encryption-bucket-key-enabled","type":"boolean"},"StorageClass":{"location":"header","locationName":"x-amz-storage-class"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"},"ReplicationStatus":{"location":"header","locationName":"x-amz-replication-status"},"PartsCount":{"location":"header","locationName":"x-amz-mp-parts-count","type":"integer"},"TagCount":{"location":"header","locationName":"x-amz-tagging-count","type":"integer"},"ObjectLockMode":{"location":"header","locationName":"x-amz-object-lock-mode"},"ObjectLockRetainUntilDate":{"shape":"S1o","location":"header","locationName":"x-amz-object-lock-retain-until-date"},"ObjectLockLegalHoldStatus":{"location":"header","locationName":"x-amz-object-lock-legal-hold"}},"payload":"Body"},"httpChecksum":{"requestValidationModeMember":"ChecksumMode","responseAlgorithms":["CRC32","CRC32C","SHA256","SHA1"]}},"GetObjectAcl":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}?acl"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"Owner":{"shape":"S3d"},"Grants":{"shape":"S3g","locationName":"AccessControlList"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}}},"GetObjectAttributes":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}?attributes"},"input":{"type":"structure","required":["Bucket","Key","ObjectAttributes"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"},"MaxParts":{"location":"header","locationName":"x-amz-max-parts","type":"integer"},"PartNumberMarker":{"location":"header","locationName":"x-amz-part-number-marker","type":"integer"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"Sk","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"},"ObjectAttributes":{"location":"header","locationName":"x-amz-object-attributes","type":"list","member":{}}}},"output":{"type":"structure","members":{"DeleteMarker":{"location":"header","locationName":"x-amz-delete-marker","type":"boolean"},"LastModified":{"location":"header","locationName":"Last-Modified","type":"timestamp"},"VersionId":{"location":"header","locationName":"x-amz-version-id"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"},"ETag":{},"Checksum":{"type":"structure","members":{"ChecksumCRC32":{},"ChecksumCRC32C":{},"ChecksumSHA1":{},"ChecksumSHA256":{}}},"ObjectParts":{"type":"structure","members":{"TotalPartsCount":{"locationName":"PartsCount","type":"integer"},"PartNumberMarker":{"type":"integer"},"NextPartNumberMarker":{"type":"integer"},"MaxParts":{"type":"integer"},"IsTruncated":{"type":"boolean"},"Parts":{"locationName":"Part","type":"list","member":{"type":"structure","members":{"PartNumber":{"type":"integer"},"Size":{"type":"integer"},"ChecksumCRC32":{},"ChecksumCRC32C":{},"ChecksumSHA1":{},"ChecksumSHA256":{}}},"flattened":true}}},"StorageClass":{},"ObjectSize":{"type":"long"}}}},"GetObjectLegalHold":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}?legal-hold"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"LegalHold":{"shape":"Sa9"}},"payload":"LegalHold"}},"GetObjectLockConfiguration":{"http":{"method":"GET","requestUri":"/{Bucket}?object-lock"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"ObjectLockConfiguration":{"shape":"Sac"}},"payload":"ObjectLockConfiguration"}},"GetObjectRetention":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}?retention"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"Retention":{"shape":"Sak"}},"payload":"Retention"}},"GetObjectTagging":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}?tagging"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"}}},"output":{"type":"structure","required":["TagSet"],"members":{"VersionId":{"location":"header","locationName":"x-amz-version-id"},"TagSet":{"shape":"S3v"}}}},"GetObjectTorrent":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}?torrent"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"Body":{"streaming":true,"type":"blob"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}},"payload":"Body"}},"GetPublicAccessBlock":{"http":{"method":"GET","requestUri":"/{Bucket}?publicAccessBlock"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"PublicAccessBlockConfiguration":{"shape":"Sar"}},"payload":"PublicAccessBlockConfiguration"}},"HeadBucket":{"http":{"method":"HEAD","requestUri":"/{Bucket}"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}}},"HeadObject":{"http":{"method":"HEAD","requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"IfMatch":{"location":"header","locationName":"If-Match"},"IfModifiedSince":{"location":"header","locationName":"If-Modified-Since","type":"timestamp"},"IfNoneMatch":{"location":"header","locationName":"If-None-Match"},"IfUnmodifiedSince":{"location":"header","locationName":"If-Unmodified-Since","type":"timestamp"},"Key":{"location":"uri","locationName":"Key"},"Range":{"location":"header","locationName":"Range"},"VersionId":{"location":"querystring","locationName":"versionId"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"Sk","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"PartNumber":{"location":"querystring","locationName":"partNumber","type":"integer"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"},"ChecksumMode":{"location":"header","locationName":"x-amz-checksum-mode"}}},"output":{"type":"structure","members":{"DeleteMarker":{"location":"header","locationName":"x-amz-delete-marker","type":"boolean"},"AcceptRanges":{"location":"header","locationName":"accept-ranges"},"Expiration":{"location":"header","locationName":"x-amz-expiration"},"Restore":{"location":"header","locationName":"x-amz-restore"},"ArchiveStatus":{"location":"header","locationName":"x-amz-archive-status"},"LastModified":{"location":"header","locationName":"Last-Modified","type":"timestamp"},"ContentLength":{"location":"header","locationName":"Content-Length","type":"long"},"ChecksumCRC32":{"location":"header","locationName":"x-amz-checksum-crc32"},"ChecksumCRC32C":{"location":"header","locationName":"x-amz-checksum-crc32c"},"ChecksumSHA1":{"location":"header","locationName":"x-amz-checksum-sha1"},"ChecksumSHA256":{"location":"header","locationName":"x-amz-checksum-sha256"},"ETag":{"location":"header","locationName":"ETag"},"MissingMeta":{"location":"header","locationName":"x-amz-missing-meta","type":"integer"},"VersionId":{"location":"header","locationName":"x-amz-version-id"},"CacheControl":{"location":"header","locationName":"Cache-Control"},"ContentDisposition":{"location":"header","locationName":"Content-Disposition"},"ContentEncoding":{"location":"header","locationName":"Content-Encoding"},"ContentLanguage":{"location":"header","locationName":"Content-Language"},"ContentType":{"location":"header","locationName":"Content-Type"},"Expires":{"location":"header","locationName":"Expires","type":"timestamp"},"WebsiteRedirectLocation":{"location":"header","locationName":"x-amz-website-redirect-location"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"Metadata":{"shape":"S1b","location":"headers","locationName":"x-amz-meta-"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sr","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"BucketKeyEnabled":{"location":"header","locationName":"x-amz-server-side-encryption-bucket-key-enabled","type":"boolean"},"StorageClass":{"location":"header","locationName":"x-amz-storage-class"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"},"ReplicationStatus":{"location":"header","locationName":"x-amz-replication-status"},"PartsCount":{"location":"header","locationName":"x-amz-mp-parts-count","type":"integer"},"ObjectLockMode":{"location":"header","locationName":"x-amz-object-lock-mode"},"ObjectLockRetainUntilDate":{"shape":"S1o","location":"header","locationName":"x-amz-object-lock-retain-until-date"},"ObjectLockLegalHoldStatus":{"location":"header","locationName":"x-amz-object-lock-legal-hold"}}}},"ListBucketAnalyticsConfigurations":{"http":{"method":"GET","requestUri":"/{Bucket}?analytics"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContinuationToken":{"location":"querystring","locationName":"continuation-token"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"IsTruncated":{"type":"boolean"},"ContinuationToken":{},"NextContinuationToken":{},"AnalyticsConfigurationList":{"locationName":"AnalyticsConfiguration","type":"list","member":{"shape":"S3p"},"flattened":true}}}},"ListBucketIntelligentTieringConfigurations":{"http":{"method":"GET","requestUri":"/{Bucket}?intelligent-tiering"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContinuationToken":{"location":"querystring","locationName":"continuation-token"}}},"output":{"type":"structure","members":{"IsTruncated":{"type":"boolean"},"ContinuationToken":{},"NextContinuationToken":{},"IntelligentTieringConfigurationList":{"locationName":"IntelligentTieringConfiguration","type":"list","member":{"shape":"S4n"},"flattened":true}}}},"ListBucketInventoryConfigurations":{"http":{"method":"GET","requestUri":"/{Bucket}?inventory"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContinuationToken":{"location":"querystring","locationName":"continuation-token"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"ContinuationToken":{},"InventoryConfigurationList":{"locationName":"InventoryConfiguration","type":"list","member":{"shape":"S4x"},"flattened":true},"IsTruncated":{"type":"boolean"},"NextContinuationToken":{}}}},"ListBucketMetricsConfigurations":{"http":{"method":"GET","requestUri":"/{Bucket}?metrics"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContinuationToken":{"location":"querystring","locationName":"continuation-token"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"IsTruncated":{"type":"boolean"},"ContinuationToken":{},"NextContinuationToken":{},"MetricsConfigurationList":{"locationName":"MetricsConfiguration","type":"list","member":{"shape":"S6d"},"flattened":true}}}},"ListBuckets":{"http":{"method":"GET"},"output":{"type":"structure","members":{"Buckets":{"type":"list","member":{"locationName":"Bucket","type":"structure","members":{"Name":{},"CreationDate":{"type":"timestamp"}}}},"Owner":{"shape":"S3d"}}},"alias":"GetService"},"ListMultipartUploads":{"http":{"method":"GET","requestUri":"/{Bucket}?uploads"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Delimiter":{"location":"querystring","locationName":"delimiter"},"EncodingType":{"location":"querystring","locationName":"encoding-type"},"KeyMarker":{"location":"querystring","locationName":"key-marker"},"MaxUploads":{"location":"querystring","locationName":"max-uploads","type":"integer"},"Prefix":{"location":"querystring","locationName":"prefix"},"UploadIdMarker":{"location":"querystring","locationName":"upload-id-marker"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"Bucket":{},"KeyMarker":{},"UploadIdMarker":{},"NextKeyMarker":{},"Prefix":{},"Delimiter":{},"NextUploadIdMarker":{},"MaxUploads":{"type":"integer"},"IsTruncated":{"type":"boolean"},"Uploads":{"locationName":"Upload","type":"list","member":{"type":"structure","members":{"UploadId":{},"Key":{},"Initiated":{"type":"timestamp"},"StorageClass":{},"Owner":{"shape":"S3d"},"Initiator":{"shape":"Sbr"},"ChecksumAlgorithm":{}}},"flattened":true},"CommonPrefixes":{"shape":"Sbs"},"EncodingType":{}}}},"ListObjectVersions":{"http":{"method":"GET","requestUri":"/{Bucket}?versions"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Delimiter":{"location":"querystring","locationName":"delimiter"},"EncodingType":{"location":"querystring","locationName":"encoding-type"},"KeyMarker":{"location":"querystring","locationName":"key-marker"},"MaxKeys":{"location":"querystring","locationName":"max-keys","type":"integer"},"Prefix":{"location":"querystring","locationName":"prefix"},"VersionIdMarker":{"location":"querystring","locationName":"version-id-marker"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"IsTruncated":{"type":"boolean"},"KeyMarker":{},"VersionIdMarker":{},"NextKeyMarker":{},"NextVersionIdMarker":{},"Versions":{"locationName":"Version","type":"list","member":{"type":"structure","members":{"ETag":{},"ChecksumAlgorithm":{"shape":"Sc1"},"Size":{"type":"integer"},"StorageClass":{},"Key":{},"VersionId":{},"IsLatest":{"type":"boolean"},"LastModified":{"type":"timestamp"},"Owner":{"shape":"S3d"}}},"flattened":true},"DeleteMarkers":{"locationName":"DeleteMarker","type":"list","member":{"type":"structure","members":{"Owner":{"shape":"S3d"},"Key":{},"VersionId":{},"IsLatest":{"type":"boolean"},"LastModified":{"type":"timestamp"}}},"flattened":true},"Name":{},"Prefix":{},"Delimiter":{},"MaxKeys":{"type":"integer"},"CommonPrefixes":{"shape":"Sbs"},"EncodingType":{}}},"alias":"GetBucketObjectVersions"},"ListObjects":{"http":{"method":"GET","requestUri":"/{Bucket}"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Delimiter":{"location":"querystring","locationName":"delimiter"},"EncodingType":{"location":"querystring","locationName":"encoding-type"},"Marker":{"location":"querystring","locationName":"marker"},"MaxKeys":{"location":"querystring","locationName":"max-keys","type":"integer"},"Prefix":{"location":"querystring","locationName":"prefix"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"IsTruncated":{"type":"boolean"},"Marker":{},"NextMarker":{},"Contents":{"shape":"Sca"},"Name":{},"Prefix":{},"Delimiter":{},"MaxKeys":{"type":"integer"},"CommonPrefixes":{"shape":"Sbs"},"EncodingType":{}}},"alias":"GetBucket"},"ListObjectsV2":{"http":{"method":"GET","requestUri":"/{Bucket}?list-type=2"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Delimiter":{"location":"querystring","locationName":"delimiter"},"EncodingType":{"location":"querystring","locationName":"encoding-type"},"MaxKeys":{"location":"querystring","locationName":"max-keys","type":"integer"},"Prefix":{"location":"querystring","locationName":"prefix"},"ContinuationToken":{"location":"querystring","locationName":"continuation-token"},"FetchOwner":{"location":"querystring","locationName":"fetch-owner","type":"boolean"},"StartAfter":{"location":"querystring","locationName":"start-after"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"IsTruncated":{"type":"boolean"},"Contents":{"shape":"Sca"},"Name":{},"Prefix":{},"Delimiter":{},"MaxKeys":{"type":"integer"},"CommonPrefixes":{"shape":"Sbs"},"EncodingType":{},"KeyCount":{"type":"integer"},"ContinuationToken":{},"NextContinuationToken":{},"StartAfter":{}}}},"ListParts":{"http":{"method":"GET","requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","Key","UploadId"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"MaxParts":{"location":"querystring","locationName":"max-parts","type":"integer"},"PartNumberMarker":{"location":"querystring","locationName":"part-number-marker","type":"integer"},"UploadId":{"location":"querystring","locationName":"uploadId"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"Sk","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"}}},"output":{"type":"structure","members":{"AbortDate":{"location":"header","locationName":"x-amz-abort-date","type":"timestamp"},"AbortRuleId":{"location":"header","locationName":"x-amz-abort-rule-id"},"Bucket":{},"Key":{},"UploadId":{},"PartNumberMarker":{"type":"integer"},"NextPartNumberMarker":{"type":"integer"},"MaxParts":{"type":"integer"},"IsTruncated":{"type":"boolean"},"Parts":{"locationName":"Part","type":"list","member":{"type":"structure","members":{"PartNumber":{"type":"integer"},"LastModified":{"type":"timestamp"},"ETag":{},"Size":{"type":"integer"},"ChecksumCRC32":{},"ChecksumCRC32C":{},"ChecksumSHA1":{},"ChecksumSHA256":{}}},"flattened":true},"Initiator":{"shape":"Sbr"},"Owner":{"shape":"S3d"},"StorageClass":{},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"},"ChecksumAlgorithm":{}}}},"PutBucketAccelerateConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?accelerate"},"input":{"type":"structure","required":["Bucket","AccelerateConfiguration"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"AccelerateConfiguration":{"locationName":"AccelerateConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","members":{"Status":{}}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"}},"payload":"AccelerateConfiguration"},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":false}},"PutBucketAcl":{"http":{"method":"PUT","requestUri":"/{Bucket}?acl"},"input":{"type":"structure","required":["Bucket"],"members":{"ACL":{"location":"header","locationName":"x-amz-acl"},"AccessControlPolicy":{"shape":"Scp","locationName":"AccessControlPolicy","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"GrantFullControl":{"location":"header","locationName":"x-amz-grant-full-control"},"GrantRead":{"location":"header","locationName":"x-amz-grant-read"},"GrantReadACP":{"location":"header","locationName":"x-amz-grant-read-acp"},"GrantWrite":{"location":"header","locationName":"x-amz-grant-write"},"GrantWriteACP":{"location":"header","locationName":"x-amz-grant-write-acp"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"AccessControlPolicy"},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutBucketAnalyticsConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?analytics"},"input":{"type":"structure","required":["Bucket","Id","AnalyticsConfiguration"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"},"AnalyticsConfiguration":{"shape":"S3p","locationName":"AnalyticsConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"AnalyticsConfiguration"}},"PutBucketCors":{"http":{"method":"PUT","requestUri":"/{Bucket}?cors"},"input":{"type":"structure","required":["Bucket","CORSConfiguration"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"CORSConfiguration":{"locationName":"CORSConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","required":["CORSRules"],"members":{"CORSRules":{"shape":"S44","locationName":"CORSRule"}}},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"CORSConfiguration"},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutBucketEncryption":{"http":{"method":"PUT","requestUri":"/{Bucket}?encryption"},"input":{"type":"structure","required":["Bucket","ServerSideEncryptionConfiguration"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"ServerSideEncryptionConfiguration":{"shape":"S4h","locationName":"ServerSideEncryptionConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"ServerSideEncryptionConfiguration"},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutBucketIntelligentTieringConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?intelligent-tiering"},"input":{"type":"structure","required":["Bucket","Id","IntelligentTieringConfiguration"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"},"IntelligentTieringConfiguration":{"shape":"S4n","locationName":"IntelligentTieringConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}}},"payload":"IntelligentTieringConfiguration"}},"PutBucketInventoryConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?inventory"},"input":{"type":"structure","required":["Bucket","Id","InventoryConfiguration"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"},"InventoryConfiguration":{"shape":"S4x","locationName":"InventoryConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"InventoryConfiguration"}},"PutBucketLifecycle":{"http":{"method":"PUT","requestUri":"/{Bucket}?lifecycle"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"LifecycleConfiguration":{"locationName":"LifecycleConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","required":["Rules"],"members":{"Rules":{"shape":"S5d","locationName":"Rule"}}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"LifecycleConfiguration"},"deprecated":true,"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutBucketLifecycleConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?lifecycle"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"LifecycleConfiguration":{"locationName":"LifecycleConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","required":["Rules"],"members":{"Rules":{"shape":"S5t","locationName":"Rule"}}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"LifecycleConfiguration"},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutBucketLogging":{"http":{"method":"PUT","requestUri":"/{Bucket}?logging"},"input":{"type":"structure","required":["Bucket","BucketLoggingStatus"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"BucketLoggingStatus":{"locationName":"BucketLoggingStatus","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","members":{"LoggingEnabled":{"shape":"S65"}}},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"BucketLoggingStatus"},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutBucketMetricsConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?metrics"},"input":{"type":"structure","required":["Bucket","Id","MetricsConfiguration"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Id":{"location":"querystring","locationName":"id"},"MetricsConfiguration":{"shape":"S6d","locationName":"MetricsConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"MetricsConfiguration"}},"PutBucketNotification":{"http":{"method":"PUT","requestUri":"/{Bucket}?notification"},"input":{"type":"structure","required":["Bucket","NotificationConfiguration"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"NotificationConfiguration":{"shape":"S6i","locationName":"NotificationConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"NotificationConfiguration"},"deprecated":true,"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutBucketNotificationConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?notification"},"input":{"type":"structure","required":["Bucket","NotificationConfiguration"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"NotificationConfiguration":{"shape":"S6t","locationName":"NotificationConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"},"SkipDestinationValidation":{"location":"header","locationName":"x-amz-skip-destination-validation","type":"boolean"}},"payload":"NotificationConfiguration"}},"PutBucketOwnershipControls":{"http":{"method":"PUT","requestUri":"/{Bucket}?ownershipControls"},"input":{"type":"structure","required":["Bucket","OwnershipControls"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"},"OwnershipControls":{"shape":"S7a","locationName":"OwnershipControls","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}}},"payload":"OwnershipControls"},"httpChecksum":{"requestChecksumRequired":true}},"PutBucketPolicy":{"http":{"method":"PUT","requestUri":"/{Bucket}?policy"},"input":{"type":"structure","required":["Bucket","Policy"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"ConfirmRemoveSelfBucketAccess":{"location":"header","locationName":"x-amz-confirm-remove-self-bucket-access","type":"boolean"},"Policy":{},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"Policy"},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutBucketReplication":{"http":{"method":"PUT","requestUri":"/{Bucket}?replication"},"input":{"type":"structure","required":["Bucket","ReplicationConfiguration"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"ReplicationConfiguration":{"shape":"S7m","locationName":"ReplicationConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"Token":{"location":"header","locationName":"x-amz-bucket-object-lock-token"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"ReplicationConfiguration"},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutBucketRequestPayment":{"http":{"method":"PUT","requestUri":"/{Bucket}?requestPayment"},"input":{"type":"structure","required":["Bucket","RequestPaymentConfiguration"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"RequestPaymentConfiguration":{"locationName":"RequestPaymentConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","required":["Payer"],"members":{"Payer":{}}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"RequestPaymentConfiguration"},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutBucketTagging":{"http":{"method":"PUT","requestUri":"/{Bucket}?tagging"},"input":{"type":"structure","required":["Bucket","Tagging"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"Tagging":{"shape":"Sdf","locationName":"Tagging","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"Tagging"},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutBucketVersioning":{"http":{"method":"PUT","requestUri":"/{Bucket}?versioning"},"input":{"type":"structure","required":["Bucket","VersioningConfiguration"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"MFA":{"location":"header","locationName":"x-amz-mfa"},"VersioningConfiguration":{"locationName":"VersioningConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","members":{"MFADelete":{"locationName":"MfaDelete"},"Status":{}}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"VersioningConfiguration"},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutBucketWebsite":{"http":{"method":"PUT","requestUri":"/{Bucket}?website"},"input":{"type":"structure","required":["Bucket","WebsiteConfiguration"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"WebsiteConfiguration":{"locationName":"WebsiteConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","members":{"ErrorDocument":{"shape":"S8u"},"IndexDocument":{"shape":"S8s"},"RedirectAllRequestsTo":{"shape":"S8p"},"RoutingRules":{"shape":"S8v"}}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"WebsiteConfiguration"},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutObject":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"ACL":{"location":"header","locationName":"x-amz-acl"},"Body":{"streaming":true,"type":"blob"},"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"CacheControl":{"location":"header","locationName":"Cache-Control"},"ContentDisposition":{"location":"header","locationName":"Content-Disposition"},"ContentEncoding":{"location":"header","locationName":"Content-Encoding"},"ContentLanguage":{"location":"header","locationName":"Content-Language"},"ContentLength":{"location":"header","locationName":"Content-Length","type":"long"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ContentType":{"location":"header","locationName":"Content-Type"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"ChecksumCRC32":{"location":"header","locationName":"x-amz-checksum-crc32"},"ChecksumCRC32C":{"location":"header","locationName":"x-amz-checksum-crc32c"},"ChecksumSHA1":{"location":"header","locationName":"x-amz-checksum-sha1"},"ChecksumSHA256":{"location":"header","locationName":"x-amz-checksum-sha256"},"Expires":{"location":"header","locationName":"Expires","type":"timestamp"},"GrantFullControl":{"location":"header","locationName":"x-amz-grant-full-control"},"GrantRead":{"location":"header","locationName":"x-amz-grant-read"},"GrantReadACP":{"location":"header","locationName":"x-amz-grant-read-acp"},"GrantWriteACP":{"location":"header","locationName":"x-amz-grant-write-acp"},"Key":{"location":"uri","locationName":"Key"},"Metadata":{"shape":"S1b","location":"headers","locationName":"x-amz-meta-"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"StorageClass":{"location":"header","locationName":"x-amz-storage-class"},"WebsiteRedirectLocation":{"location":"header","locationName":"x-amz-website-redirect-location"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"Sk","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sr","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"SSEKMSEncryptionContext":{"shape":"S1i","location":"header","locationName":"x-amz-server-side-encryption-context"},"BucketKeyEnabled":{"location":"header","locationName":"x-amz-server-side-encryption-bucket-key-enabled","type":"boolean"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"Tagging":{"location":"header","locationName":"x-amz-tagging"},"ObjectLockMode":{"location":"header","locationName":"x-amz-object-lock-mode"},"ObjectLockRetainUntilDate":{"shape":"S1o","location":"header","locationName":"x-amz-object-lock-retain-until-date"},"ObjectLockLegalHoldStatus":{"location":"header","locationName":"x-amz-object-lock-legal-hold"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"Body"},"output":{"type":"structure","members":{"Expiration":{"location":"header","locationName":"x-amz-expiration"},"ETag":{"location":"header","locationName":"ETag"},"ChecksumCRC32":{"location":"header","locationName":"x-amz-checksum-crc32"},"ChecksumCRC32C":{"location":"header","locationName":"x-amz-checksum-crc32c"},"ChecksumSHA1":{"location":"header","locationName":"x-amz-checksum-sha1"},"ChecksumSHA256":{"location":"header","locationName":"x-amz-checksum-sha256"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"VersionId":{"location":"header","locationName":"x-amz-version-id"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sr","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"SSEKMSEncryptionContext":{"shape":"S1i","location":"header","locationName":"x-amz-server-side-encryption-context"},"BucketKeyEnabled":{"location":"header","locationName":"x-amz-server-side-encryption-bucket-key-enabled","type":"boolean"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":false}},"PutObjectAcl":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}?acl"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"ACL":{"location":"header","locationName":"x-amz-acl"},"AccessControlPolicy":{"shape":"Scp","locationName":"AccessControlPolicy","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"GrantFullControl":{"location":"header","locationName":"x-amz-grant-full-control"},"GrantRead":{"location":"header","locationName":"x-amz-grant-read"},"GrantReadACP":{"location":"header","locationName":"x-amz-grant-read-acp"},"GrantWrite":{"location":"header","locationName":"x-amz-grant-write"},"GrantWriteACP":{"location":"header","locationName":"x-amz-grant-write-acp"},"Key":{"location":"uri","locationName":"Key"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"VersionId":{"location":"querystring","locationName":"versionId"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"AccessControlPolicy"},"output":{"type":"structure","members":{"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutObjectLegalHold":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}?legal-hold"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"LegalHold":{"shape":"Sa9","locationName":"LegalHold","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"VersionId":{"location":"querystring","locationName":"versionId"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"LegalHold"},"output":{"type":"structure","members":{"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutObjectLockConfiguration":{"http":{"method":"PUT","requestUri":"/{Bucket}?object-lock"},"input":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ObjectLockConfiguration":{"shape":"Sac","locationName":"ObjectLockConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"Token":{"location":"header","locationName":"x-amz-bucket-object-lock-token"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"ObjectLockConfiguration"},"output":{"type":"structure","members":{"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutObjectRetention":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}?retention"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"Retention":{"shape":"Sak","locationName":"Retention","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"VersionId":{"location":"querystring","locationName":"versionId"},"BypassGovernanceRetention":{"location":"header","locationName":"x-amz-bypass-governance-retention","type":"boolean"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"Retention"},"output":{"type":"structure","members":{"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutObjectTagging":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}?tagging"},"input":{"type":"structure","required":["Bucket","Key","Tagging"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"Tagging":{"shape":"Sdf","locationName":"Tagging","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"}},"payload":"Tagging"},"output":{"type":"structure","members":{"VersionId":{"location":"header","locationName":"x-amz-version-id"}}},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"PutPublicAccessBlock":{"http":{"method":"PUT","requestUri":"/{Bucket}?publicAccessBlock"},"input":{"type":"structure","required":["Bucket","PublicAccessBlockConfiguration"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"PublicAccessBlockConfiguration":{"shape":"Sar","locationName":"PublicAccessBlockConfiguration","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"PublicAccessBlockConfiguration"},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":true}},"RestoreObject":{"http":{"requestUri":"/{Bucket}/{Key+}?restore"},"input":{"type":"structure","required":["Bucket","Key"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"VersionId":{"location":"querystring","locationName":"versionId"},"RestoreRequest":{"locationName":"RestoreRequest","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","members":{"Days":{"type":"integer"},"GlacierJobParameters":{"type":"structure","required":["Tier"],"members":{"Tier":{}}},"Type":{},"Tier":{},"Description":{},"SelectParameters":{"type":"structure","required":["InputSerialization","ExpressionType","Expression","OutputSerialization"],"members":{"InputSerialization":{"shape":"Se5"},"ExpressionType":{},"Expression":{},"OutputSerialization":{"shape":"Sek"}}},"OutputLocation":{"type":"structure","members":{"S3":{"type":"structure","required":["BucketName","Prefix"],"members":{"BucketName":{},"Prefix":{},"Encryption":{"type":"structure","required":["EncryptionType"],"members":{"EncryptionType":{},"KMSKeyId":{"shape":"Sr"},"KMSContext":{}}},"CannedACL":{},"AccessControlList":{"shape":"S3g"},"Tagging":{"shape":"Sdf"},"UserMetadata":{"type":"list","member":{"locationName":"MetadataEntry","type":"structure","members":{"Name":{},"Value":{}}}},"StorageClass":{}}}}}}},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"RestoreRequest"},"output":{"type":"structure","members":{"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"},"RestoreOutputPath":{"location":"header","locationName":"x-amz-restore-output-path"}}},"alias":"PostObjectRestore","httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":false}},"SelectObjectContent":{"http":{"requestUri":"/{Bucket}/{Key+}?select&select-type=2"},"input":{"locationName":"SelectObjectContentRequest","xmlNamespace":{"uri":"http://s3.amazonaws.com/doc/2006-03-01/"},"type":"structure","required":["Bucket","Key","Expression","ExpressionType","InputSerialization","OutputSerialization"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"Key":{"location":"uri","locationName":"Key"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"Sk","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"Expression":{},"ExpressionType":{},"RequestProgress":{"type":"structure","members":{"Enabled":{"type":"boolean"}}},"InputSerialization":{"shape":"Se5"},"OutputSerialization":{"shape":"Sek"},"ScanRange":{"type":"structure","members":{"Start":{"type":"long"},"End":{"type":"long"}}},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"output":{"type":"structure","members":{"Payload":{"type":"structure","members":{"Records":{"type":"structure","members":{"Payload":{"eventpayload":true,"type":"blob"}},"event":true},"Stats":{"type":"structure","members":{"Details":{"eventpayload":true,"type":"structure","members":{"BytesScanned":{"type":"long"},"BytesProcessed":{"type":"long"},"BytesReturned":{"type":"long"}}}},"event":true},"Progress":{"type":"structure","members":{"Details":{"eventpayload":true,"type":"structure","members":{"BytesScanned":{"type":"long"},"BytesProcessed":{"type":"long"},"BytesReturned":{"type":"long"}}}},"event":true},"Cont":{"type":"structure","members":{},"event":true},"End":{"type":"structure","members":{},"event":true}},"eventstream":true}},"payload":"Payload"}},"UploadPart":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","Key","PartNumber","UploadId"],"members":{"Body":{"streaming":true,"type":"blob"},"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ContentLength":{"location":"header","locationName":"Content-Length","type":"long"},"ContentMD5":{"location":"header","locationName":"Content-MD5"},"ChecksumAlgorithm":{"location":"header","locationName":"x-amz-sdk-checksum-algorithm"},"ChecksumCRC32":{"location":"header","locationName":"x-amz-checksum-crc32"},"ChecksumCRC32C":{"location":"header","locationName":"x-amz-checksum-crc32c"},"ChecksumSHA1":{"location":"header","locationName":"x-amz-checksum-sha1"},"ChecksumSHA256":{"location":"header","locationName":"x-amz-checksum-sha256"},"Key":{"location":"uri","locationName":"Key"},"PartNumber":{"location":"querystring","locationName":"partNumber","type":"integer"},"UploadId":{"location":"querystring","locationName":"uploadId"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"Sk","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}},"payload":"Body"},"output":{"type":"structure","members":{"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"ETag":{"location":"header","locationName":"ETag"},"ChecksumCRC32":{"location":"header","locationName":"x-amz-checksum-crc32"},"ChecksumCRC32C":{"location":"header","locationName":"x-amz-checksum-crc32c"},"ChecksumSHA1":{"location":"header","locationName":"x-amz-checksum-sha1"},"ChecksumSHA256":{"location":"header","locationName":"x-amz-checksum-sha256"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sr","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"BucketKeyEnabled":{"location":"header","locationName":"x-amz-server-side-encryption-bucket-key-enabled","type":"boolean"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}}},"httpChecksum":{"requestAlgorithmMember":"ChecksumAlgorithm","requestChecksumRequired":false}},"UploadPartCopy":{"http":{"method":"PUT","requestUri":"/{Bucket}/{Key+}"},"input":{"type":"structure","required":["Bucket","CopySource","Key","PartNumber","UploadId"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"CopySource":{"location":"header","locationName":"x-amz-copy-source"},"CopySourceIfMatch":{"location":"header","locationName":"x-amz-copy-source-if-match"},"CopySourceIfModifiedSince":{"location":"header","locationName":"x-amz-copy-source-if-modified-since","type":"timestamp"},"CopySourceIfNoneMatch":{"location":"header","locationName":"x-amz-copy-source-if-none-match"},"CopySourceIfUnmodifiedSince":{"location":"header","locationName":"x-amz-copy-source-if-unmodified-since","type":"timestamp"},"CopySourceRange":{"location":"header","locationName":"x-amz-copy-source-range"},"Key":{"location":"uri","locationName":"Key"},"PartNumber":{"location":"querystring","locationName":"partNumber","type":"integer"},"UploadId":{"location":"querystring","locationName":"uploadId"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKey":{"shape":"Sk","location":"header","locationName":"x-amz-server-side-encryption-customer-key"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"CopySourceSSECustomerAlgorithm":{"location":"header","locationName":"x-amz-copy-source-server-side-encryption-customer-algorithm"},"CopySourceSSECustomerKey":{"shape":"S1k","location":"header","locationName":"x-amz-copy-source-server-side-encryption-customer-key"},"CopySourceSSECustomerKeyMD5":{"location":"header","locationName":"x-amz-copy-source-server-side-encryption-customer-key-MD5"},"RequestPayer":{"location":"header","locationName":"x-amz-request-payer"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"},"ExpectedSourceBucketOwner":{"location":"header","locationName":"x-amz-source-expected-bucket-owner"}}},"output":{"type":"structure","members":{"CopySourceVersionId":{"location":"header","locationName":"x-amz-copy-source-version-id"},"CopyPartResult":{"type":"structure","members":{"ETag":{},"LastModified":{"type":"timestamp"},"ChecksumCRC32":{},"ChecksumCRC32C":{},"ChecksumSHA1":{},"ChecksumSHA256":{}}},"ServerSideEncryption":{"location":"header","locationName":"x-amz-server-side-encryption"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-server-side-encryption-customer-algorithm"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-server-side-encryption-customer-key-MD5"},"SSEKMSKeyId":{"shape":"Sr","location":"header","locationName":"x-amz-server-side-encryption-aws-kms-key-id"},"BucketKeyEnabled":{"location":"header","locationName":"x-amz-server-side-encryption-bucket-key-enabled","type":"boolean"},"RequestCharged":{"location":"header","locationName":"x-amz-request-charged"}},"payload":"CopyPartResult"}},"WriteGetObjectResponse":{"http":{"requestUri":"/WriteGetObjectResponse"},"input":{"type":"structure","required":["RequestRoute","RequestToken"],"members":{"RequestRoute":{"hostLabel":true,"location":"header","locationName":"x-amz-request-route"},"RequestToken":{"location":"header","locationName":"x-amz-request-token"},"Body":{"streaming":true,"type":"blob"},"StatusCode":{"location":"header","locationName":"x-amz-fwd-status","type":"integer"},"ErrorCode":{"location":"header","locationName":"x-amz-fwd-error-code"},"ErrorMessage":{"location":"header","locationName":"x-amz-fwd-error-message"},"AcceptRanges":{"location":"header","locationName":"x-amz-fwd-header-accept-ranges"},"CacheControl":{"location":"header","locationName":"x-amz-fwd-header-Cache-Control"},"ContentDisposition":{"location":"header","locationName":"x-amz-fwd-header-Content-Disposition"},"ContentEncoding":{"location":"header","locationName":"x-amz-fwd-header-Content-Encoding"},"ContentLanguage":{"location":"header","locationName":"x-amz-fwd-header-Content-Language"},"ContentLength":{"location":"header","locationName":"Content-Length","type":"long"},"ContentRange":{"location":"header","locationName":"x-amz-fwd-header-Content-Range"},"ContentType":{"location":"header","locationName":"x-amz-fwd-header-Content-Type"},"ChecksumCRC32":{"location":"header","locationName":"x-amz-fwd-header-x-amz-checksum-crc32"},"ChecksumCRC32C":{"location":"header","locationName":"x-amz-fwd-header-x-amz-checksum-crc32c"},"ChecksumSHA1":{"location":"header","locationName":"x-amz-fwd-header-x-amz-checksum-sha1"},"ChecksumSHA256":{"location":"header","locationName":"x-amz-fwd-header-x-amz-checksum-sha256"},"DeleteMarker":{"location":"header","locationName":"x-amz-fwd-header-x-amz-delete-marker","type":"boolean"},"ETag":{"location":"header","locationName":"x-amz-fwd-header-ETag"},"Expires":{"location":"header","locationName":"x-amz-fwd-header-Expires","type":"timestamp"},"Expiration":{"location":"header","locationName":"x-amz-fwd-header-x-amz-expiration"},"LastModified":{"location":"header","locationName":"x-amz-fwd-header-Last-Modified","type":"timestamp"},"MissingMeta":{"location":"header","locationName":"x-amz-fwd-header-x-amz-missing-meta","type":"integer"},"Metadata":{"shape":"S1b","location":"headers","locationName":"x-amz-meta-"},"ObjectLockMode":{"location":"header","locationName":"x-amz-fwd-header-x-amz-object-lock-mode"},"ObjectLockLegalHoldStatus":{"location":"header","locationName":"x-amz-fwd-header-x-amz-object-lock-legal-hold"},"ObjectLockRetainUntilDate":{"shape":"S1o","location":"header","locationName":"x-amz-fwd-header-x-amz-object-lock-retain-until-date"},"PartsCount":{"location":"header","locationName":"x-amz-fwd-header-x-amz-mp-parts-count","type":"integer"},"ReplicationStatus":{"location":"header","locationName":"x-amz-fwd-header-x-amz-replication-status"},"RequestCharged":{"location":"header","locationName":"x-amz-fwd-header-x-amz-request-charged"},"Restore":{"location":"header","locationName":"x-amz-fwd-header-x-amz-restore"},"ServerSideEncryption":{"location":"header","locationName":"x-amz-fwd-header-x-amz-server-side-encryption"},"SSECustomerAlgorithm":{"location":"header","locationName":"x-amz-fwd-header-x-amz-server-side-encryption-customer-algorithm"},"SSEKMSKeyId":{"shape":"Sr","location":"header","locationName":"x-amz-fwd-header-x-amz-server-side-encryption-aws-kms-key-id"},"SSECustomerKeyMD5":{"location":"header","locationName":"x-amz-fwd-header-x-amz-server-side-encryption-customer-key-MD5"},"StorageClass":{"location":"header","locationName":"x-amz-fwd-header-x-amz-storage-class"},"TagCount":{"location":"header","locationName":"x-amz-fwd-header-x-amz-tagging-count","type":"integer"},"VersionId":{"location":"header","locationName":"x-amz-fwd-header-x-amz-version-id"},"BucketKeyEnabled":{"location":"header","locationName":"x-amz-fwd-header-x-amz-server-side-encryption-bucket-key-enabled","type":"boolean"}},"payload":"Body"},"authtype":"v4-unsigned-body","endpoint":{"hostPrefix":"{RequestRoute}."},"staticContextParams":{"UseObjectLambdaEndpoint":{"value":true}}}},"shapes":{"Sk":{"type":"blob","sensitive":true},"Sr":{"type":"string","sensitive":true},"S1b":{"type":"map","key":{},"value":{}},"S1i":{"type":"string","sensitive":true},"S1k":{"type":"blob","sensitive":true},"S1o":{"type":"timestamp","timestampFormat":"iso8601"},"S3d":{"type":"structure","members":{"DisplayName":{},"ID":{}}},"S3g":{"type":"list","member":{"locationName":"Grant","type":"structure","members":{"Grantee":{"shape":"S3i"},"Permission":{}}}},"S3i":{"type":"structure","required":["Type"],"members":{"DisplayName":{},"EmailAddress":{},"ID":{},"Type":{"locationName":"xsi:type","xmlAttribute":true},"URI":{}},"xmlNamespace":{"prefix":"xsi","uri":"http://www.w3.org/2001/XMLSchema-instance"}},"S3p":{"type":"structure","required":["Id","StorageClassAnalysis"],"members":{"Id":{},"Filter":{"type":"structure","members":{"Prefix":{},"Tag":{"shape":"S3s"},"And":{"type":"structure","members":{"Prefix":{},"Tags":{"shape":"S3v","flattened":true,"locationName":"Tag"}}}}},"StorageClassAnalysis":{"type":"structure","members":{"DataExport":{"type":"structure","required":["OutputSchemaVersion","Destination"],"members":{"OutputSchemaVersion":{},"Destination":{"type":"structure","required":["S3BucketDestination"],"members":{"S3BucketDestination":{"type":"structure","required":["Format","Bucket"],"members":{"Format":{},"BucketAccountId":{},"Bucket":{},"Prefix":{}}}}}}}}}}},"S3s":{"type":"structure","required":["Key","Value"],"members":{"Key":{},"Value":{}}},"S3v":{"type":"list","member":{"shape":"S3s","locationName":"Tag"}},"S44":{"type":"list","member":{"type":"structure","required":["AllowedMethods","AllowedOrigins"],"members":{"ID":{},"AllowedHeaders":{"locationName":"AllowedHeader","type":"list","member":{},"flattened":true},"AllowedMethods":{"locationName":"AllowedMethod","type":"list","member":{},"flattened":true},"AllowedOrigins":{"locationName":"AllowedOrigin","type":"list","member":{},"flattened":true},"ExposeHeaders":{"locationName":"ExposeHeader","type":"list","member":{},"flattened":true},"MaxAgeSeconds":{"type":"integer"}}},"flattened":true},"S4h":{"type":"structure","required":["Rules"],"members":{"Rules":{"locationName":"Rule","type":"list","member":{"type":"structure","members":{"ApplyServerSideEncryptionByDefault":{"type":"structure","required":["SSEAlgorithm"],"members":{"SSEAlgorithm":{},"KMSMasterKeyID":{"shape":"Sr"}}},"BucketKeyEnabled":{"type":"boolean"}}},"flattened":true}}},"S4n":{"type":"structure","required":["Id","Status","Tierings"],"members":{"Id":{},"Filter":{"type":"structure","members":{"Prefix":{},"Tag":{"shape":"S3s"},"And":{"type":"structure","members":{"Prefix":{},"Tags":{"shape":"S3v","flattened":true,"locationName":"Tag"}}}}},"Status":{},"Tierings":{"locationName":"Tiering","type":"list","member":{"type":"structure","required":["Days","AccessTier"],"members":{"Days":{"type":"integer"},"AccessTier":{}}},"flattened":true}}},"S4x":{"type":"structure","required":["Destination","IsEnabled","Id","IncludedObjectVersions","Schedule"],"members":{"Destination":{"type":"structure","required":["S3BucketDestination"],"members":{"S3BucketDestination":{"type":"structure","required":["Bucket","Format"],"members":{"AccountId":{},"Bucket":{},"Format":{},"Prefix":{},"Encryption":{"type":"structure","members":{"SSES3":{"locationName":"SSE-S3","type":"structure","members":{}},"SSEKMS":{"locationName":"SSE-KMS","type":"structure","required":["KeyId"],"members":{"KeyId":{"shape":"Sr"}}}}}}}}},"IsEnabled":{"type":"boolean"},"Filter":{"type":"structure","required":["Prefix"],"members":{"Prefix":{}}},"Id":{},"IncludedObjectVersions":{},"OptionalFields":{"type":"list","member":{"locationName":"Field"}},"Schedule":{"type":"structure","required":["Frequency"],"members":{"Frequency":{}}}}},"S5d":{"type":"list","member":{"type":"structure","required":["Prefix","Status"],"members":{"Expiration":{"shape":"S5f"},"ID":{},"Prefix":{},"Status":{},"Transition":{"shape":"S5k"},"NoncurrentVersionTransition":{"shape":"S5m"},"NoncurrentVersionExpiration":{"shape":"S5o"},"AbortIncompleteMultipartUpload":{"shape":"S5p"}}},"flattened":true},"S5f":{"type":"structure","members":{"Date":{"shape":"S5g"},"Days":{"type":"integer"},"ExpiredObjectDeleteMarker":{"type":"boolean"}}},"S5g":{"type":"timestamp","timestampFormat":"iso8601"},"S5k":{"type":"structure","members":{"Date":{"shape":"S5g"},"Days":{"type":"integer"},"StorageClass":{}}},"S5m":{"type":"structure","members":{"NoncurrentDays":{"type":"integer"},"StorageClass":{},"NewerNoncurrentVersions":{"type":"integer"}}},"S5o":{"type":"structure","members":{"NoncurrentDays":{"type":"integer"},"NewerNoncurrentVersions":{"type":"integer"}}},"S5p":{"type":"structure","members":{"DaysAfterInitiation":{"type":"integer"}}},"S5t":{"type":"list","member":{"type":"structure","required":["Status"],"members":{"Expiration":{"shape":"S5f"},"ID":{},"Prefix":{"deprecated":true},"Filter":{"type":"structure","members":{"Prefix":{},"Tag":{"shape":"S3s"},"ObjectSizeGreaterThan":{"type":"long"},"ObjectSizeLessThan":{"type":"long"},"And":{"type":"structure","members":{"Prefix":{},"Tags":{"shape":"S3v","flattened":true,"locationName":"Tag"},"ObjectSizeGreaterThan":{"type":"long"},"ObjectSizeLessThan":{"type":"long"}}}}},"Status":{},"Transitions":{"locationName":"Transition","type":"list","member":{"shape":"S5k"},"flattened":true},"NoncurrentVersionTransitions":{"locationName":"NoncurrentVersionTransition","type":"list","member":{"shape":"S5m"},"flattened":true},"NoncurrentVersionExpiration":{"shape":"S5o"},"AbortIncompleteMultipartUpload":{"shape":"S5p"}}},"flattened":true},"S65":{"type":"structure","required":["TargetBucket","TargetPrefix"],"members":{"TargetBucket":{},"TargetGrants":{"type":"list","member":{"locationName":"Grant","type":"structure","members":{"Grantee":{"shape":"S3i"},"Permission":{}}}},"TargetPrefix":{}}},"S6d":{"type":"structure","required":["Id"],"members":{"Id":{},"Filter":{"type":"structure","members":{"Prefix":{},"Tag":{"shape":"S3s"},"AccessPointArn":{},"And":{"type":"structure","members":{"Prefix":{},"Tags":{"shape":"S3v","flattened":true,"locationName":"Tag"},"AccessPointArn":{}}}}}}},"S6h":{"type":"structure","required":["Bucket"],"members":{"Bucket":{"contextParam":{"name":"Bucket"},"location":"uri","locationName":"Bucket"},"ExpectedBucketOwner":{"location":"header","locationName":"x-amz-expected-bucket-owner"}}},"S6i":{"type":"structure","members":{"TopicConfiguration":{"type":"structure","members":{"Id":{},"Events":{"shape":"S6l","locationName":"Event"},"Event":{"deprecated":true},"Topic":{}}},"QueueConfiguration":{"type":"structure","members":{"Id":{},"Event":{"deprecated":true},"Events":{"shape":"S6l","locationName":"Event"},"Queue":{}}},"CloudFunctionConfiguration":{"type":"structure","members":{"Id":{},"Event":{"deprecated":true},"Events":{"shape":"S6l","locationName":"Event"},"CloudFunction":{},"InvocationRole":{}}}}},"S6l":{"type":"list","member":{},"flattened":true},"S6t":{"type":"structure","members":{"TopicConfigurations":{"locationName":"TopicConfiguration","type":"list","member":{"type":"structure","required":["TopicArn","Events"],"members":{"Id":{},"TopicArn":{"locationName":"Topic"},"Events":{"shape":"S6l","locationName":"Event"},"Filter":{"shape":"S6w"}}},"flattened":true},"QueueConfigurations":{"locationName":"QueueConfiguration","type":"list","member":{"type":"structure","required":["QueueArn","Events"],"members":{"Id":{},"QueueArn":{"locationName":"Queue"},"Events":{"shape":"S6l","locationName":"Event"},"Filter":{"shape":"S6w"}}},"flattened":true},"LambdaFunctionConfigurations":{"locationName":"CloudFunctionConfiguration","type":"list","member":{"type":"structure","required":["LambdaFunctionArn","Events"],"members":{"Id":{},"LambdaFunctionArn":{"locationName":"CloudFunction"},"Events":{"shape":"S6l","locationName":"Event"},"Filter":{"shape":"S6w"}}},"flattened":true},"EventBridgeConfiguration":{"type":"structure","members":{}}}},"S6w":{"type":"structure","members":{"Key":{"locationName":"S3Key","type":"structure","members":{"FilterRules":{"locationName":"FilterRule","type":"list","member":{"type":"structure","members":{"Name":{},"Value":{}}},"flattened":true}}}}},"S7a":{"type":"structure","required":["Rules"],"members":{"Rules":{"locationName":"Rule","type":"list","member":{"type":"structure","required":["ObjectOwnership"],"members":{"ObjectOwnership":{}}},"flattened":true}}},"S7m":{"type":"structure","required":["Role","Rules"],"members":{"Role":{},"Rules":{"locationName":"Rule","type":"list","member":{"type":"structure","required":["Status","Destination"],"members":{"ID":{},"Priority":{"type":"integer"},"Prefix":{"deprecated":true},"Filter":{"type":"structure","members":{"Prefix":{},"Tag":{"shape":"S3s"},"And":{"type":"structure","members":{"Prefix":{},"Tags":{"shape":"S3v","flattened":true,"locationName":"Tag"}}}}},"Status":{},"SourceSelectionCriteria":{"type":"structure","members":{"SseKmsEncryptedObjects":{"type":"structure","required":["Status"],"members":{"Status":{}}},"ReplicaModifications":{"type":"structure","required":["Status"],"members":{"Status":{}}}}},"ExistingObjectReplication":{"type":"structure","required":["Status"],"members":{"Status":{}}},"Destination":{"type":"structure","required":["Bucket"],"members":{"Bucket":{},"Account":{},"StorageClass":{},"AccessControlTranslation":{"type":"structure","required":["Owner"],"members":{"Owner":{}}},"EncryptionConfiguration":{"type":"structure","members":{"ReplicaKmsKeyID":{}}},"ReplicationTime":{"type":"structure","required":["Status","Time"],"members":{"Status":{},"Time":{"shape":"S88"}}},"Metrics":{"type":"structure","required":["Status"],"members":{"Status":{},"EventThreshold":{"shape":"S88"}}}}},"DeleteMarkerReplication":{"type":"structure","members":{"Status":{}}}}},"flattened":true}}},"S88":{"type":"structure","members":{"Minutes":{"type":"integer"}}},"S8p":{"type":"structure","required":["HostName"],"members":{"HostName":{},"Protocol":{}}},"S8s":{"type":"structure","required":["Suffix"],"members":{"Suffix":{}}},"S8u":{"type":"structure","required":["Key"],"members":{"Key":{}}},"S8v":{"type":"list","member":{"locationName":"RoutingRule","type":"structure","required":["Redirect"],"members":{"Condition":{"type":"structure","members":{"HttpErrorCodeReturnedEquals":{},"KeyPrefixEquals":{}}},"Redirect":{"type":"structure","members":{"HostName":{},"HttpRedirectCode":{},"Protocol":{},"ReplaceKeyPrefixWith":{},"ReplaceKeyWith":{}}}}}},"Sa9":{"type":"structure","members":{"Status":{}}},"Sac":{"type":"structure","members":{"ObjectLockEnabled":{},"Rule":{"type":"structure","members":{"DefaultRetention":{"type":"structure","members":{"Mode":{},"Days":{"type":"integer"},"Years":{"type":"integer"}}}}}}},"Sak":{"type":"structure","members":{"Mode":{},"RetainUntilDate":{"shape":"S5g"}}},"Sar":{"type":"structure","members":{"BlockPublicAcls":{"locationName":"BlockPublicAcls","type":"boolean"},"IgnorePublicAcls":{"locationName":"IgnorePublicAcls","type":"boolean"},"BlockPublicPolicy":{"locationName":"BlockPublicPolicy","type":"boolean"},"RestrictPublicBuckets":{"locationName":"RestrictPublicBuckets","type":"boolean"}}},"Sbr":{"type":"structure","members":{"ID":{},"DisplayName":{}}},"Sbs":{"type":"list","member":{"type":"structure","members":{"Prefix":{}}},"flattened":true},"Sc1":{"type":"list","member":{},"flattened":true},"Sca":{"type":"list","member":{"type":"structure","members":{"Key":{},"LastModified":{"type":"timestamp"},"ETag":{},"ChecksumAlgorithm":{"shape":"Sc1"},"Size":{"type":"integer"},"StorageClass":{},"Owner":{"shape":"S3d"}}},"flattened":true},"Scp":{"type":"structure","members":{"Grants":{"shape":"S3g","locationName":"AccessControlList"},"Owner":{"shape":"S3d"}}},"Sdf":{"type":"structure","required":["TagSet"],"members":{"TagSet":{"shape":"S3v"}}},"Se5":{"type":"structure","members":{"CSV":{"type":"structure","members":{"FileHeaderInfo":{},"Comments":{},"QuoteEscapeCharacter":{},"RecordDelimiter":{},"FieldDelimiter":{},"QuoteCharacter":{},"AllowQuotedRecordDelimiter":{"type":"boolean"}}},"CompressionType":{},"JSON":{"type":"structure","members":{"Type":{}}},"Parquet":{"type":"structure","members":{}}}},"Sek":{"type":"structure","members":{"CSV":{"type":"structure","members":{"QuoteFields":{},"QuoteEscapeCharacter":{},"RecordDelimiter":{},"FieldDelimiter":{},"QuoteCharacter":{}}},"JSON":{"type":"structure","members":{"RecordDelimiter":{}}}}}},"clientContextParams":{"Accelerate":{"documentation":"Enables this client to use S3 Transfer Acceleration endpoints.","type":"boolean"},"DisableMultiRegionAccessPoints":{"documentation":"Disables this client's usage of Multi-Region Access Points.","type":"boolean"},"ForcePathStyle":{"documentation":"Forces this client to use path-style addressing for buckets.","type":"boolean"},"UseArnRegion":{"documentation":"Enables this client to use an ARN's region when constructing an endpoint instead of the client's configured region.","type":"boolean"}}};
 
 /***/ }),
-/* 898 */
-/***/ (function(module, __unusedexports, __webpack_require__) {
-
-var v1 = __webpack_require__(86);
-var v4 = __webpack_require__(826);
-
-var uuid = v4;
-uuid.v1 = v1;
-uuid.v4 = v4;
-
-module.exports = uuid;
-
-
-/***/ }),
+/* 898 */,
 /* 899 */,
-/* 900 */,
+/* 900 */
+/***/ (function(__unusedmodule, exports) {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", { value: true });
+const NODE_PROCESS_VERSION_PARTS = process.versions.node.split('.');
+const MAJOR_VERSION = parseInt(NODE_PROCESS_VERSION_PARTS[0], 10);
+const MINOR_VERSION = parseInt(NODE_PROCESS_VERSION_PARTS[1], 10);
+const SUPPORTED_MAJOR_VERSION = 10;
+const SUPPORTED_MINOR_VERSION = 10;
+const IS_MATCHED_BY_MAJOR = MAJOR_VERSION > SUPPORTED_MAJOR_VERSION;
+const IS_MATCHED_BY_MAJOR_AND_MINOR = MAJOR_VERSION === SUPPORTED_MAJOR_VERSION && MINOR_VERSION >= SUPPORTED_MINOR_VERSION;
+/**
+ * IS `true` for Node.js 10.10 and greater.
+ */
+exports.IS_SUPPORT_READDIR_WITH_FILE_TYPES = IS_MATCHED_BY_MAJOR || IS_MATCHED_BY_MAJOR_AND_MINOR;
+
+
+/***/ }),
 /* 901 */,
 /* 902 */
 /***/ (function(module, __unusedexports, __webpack_require__) {
@@ -27085,6 +31188,7 @@ AWS.CredentialProviderChain = AWS.util.inherit(AWS.Credentials, {
  * AWS.CredentialProviderChain.defaultProviders = [
  *   function () { return new AWS.EnvironmentCredentials('AWS'); },
  *   function () { return new AWS.EnvironmentCredentials('AMAZON'); },
+ *   function () { return new AWS.SsoCredentials(); },
  *   function () { return new AWS.SharedIniFileCredentials(); },
  *   function () { return new AWS.ECSCredentials(); },
  *   function () { return new AWS.ProcessCredentials(); },
@@ -27154,8 +31258,9 @@ function extractError(resp) {
   if (httpResponse.body.length > 0) {
     try {
       var e = JSON.parse(httpResponse.body.toString());
-      if (e.__type || e.code) {
-        error.code = (e.__type || e.code).split('#').pop();
+      var code = e.__type || e.code || e.Code;
+      if (code) {
+        error.code = code.split('#').pop();
       }
       if (error.code === 'RequestEntityTooLarge') {
         error.message = 'Request body must be less than 1 MB';
@@ -27867,7 +31972,7 @@ module.exports = {
 
 Object.defineProperty(exports, "__esModule", { value: true });
 const path = __webpack_require__(622);
-const fsStat = __webpack_require__(858);
+const fsStat = __webpack_require__(109);
 const utils = __webpack_require__(501);
 class Reader {
     constructor(_settings) {
@@ -28248,15 +32353,28 @@ var util = {
     parse: function string(ini) {
       var currentSection, map = {};
       util.arrayEach(ini.split(/\r?\n/), function(line) {
-        line = line.split(/(^|\s)[;#]/)[0]; // remove comments
-        var section = line.match(/^\s*\[([^\[\]]+)\]\s*$/);
-        if (section) {
-          currentSection = section[1];
+        line = line.split(/(^|\s)[;#]/)[0].trim(); // remove comments and trim
+        var isSection = line[0] === '[' && line[line.length - 1] === ']';
+        if (isSection) {
+          currentSection = line.substring(1, line.length - 1);
+          if (currentSection === '__proto__' || currentSection.split(/\s/)[1] === '__proto__') {
+            throw util.error(
+              new Error('Cannot load profile name \'' + currentSection + '\' from shared ini file.')
+            );
+          }
         } else if (currentSection) {
-          var item = line.match(/^\s*(.+?)\s*=\s*(.+?)\s*$/);
-          if (item) {
+          var indexOfEqualsSign = line.indexOf('=');
+          var start = 0;
+          var end = line.length - 1;
+          var isAssignment =
+            indexOfEqualsSign !== -1 && indexOfEqualsSign !== start && indexOfEqualsSign !== end;
+
+          if (isAssignment) {
+            var name = line.substring(0, indexOfEqualsSign).trim();
+            var value = line.substring(indexOfEqualsSign + 1).trim();
+
             map[currentSection] = map[currentSection] || {};
-            map[currentSection][item[1]] = item[2];
+            map[currentSection][name] = value;
           }
         }
       });
@@ -28906,13 +33024,17 @@ var util = {
     var errCallback = function(err) {
       var maxRetries = options.maxRetries || 0;
       if (err && err.code === 'TimeoutError') err.retryable = true;
-      var delay = util.calculateRetryDelay(retryCount, options.retryDelayOptions, err);
-      if (err && err.retryable && retryCount < maxRetries && delay >= 0) {
-        retryCount++;
-        setTimeout(sendRequest, delay + (err.retryAfter || 0));
-      } else {
-        cb(err);
+
+      // Call `calculateRetryDelay()` only when relevant, see #3401
+      if (err && err.retryable && retryCount < maxRetries) {
+        var delay = util.calculateRetryDelay(retryCount, options.retryDelayOptions, err);
+        if (delay >= 0) {
+          retryCount++;
+          setTimeout(sendRequest, delay + (err.retryAfter || 0));
+          return;
+        }
       }
+      cb(err);
     };
 
     var sendRequest = function() {
@@ -28946,7 +33068,7 @@ var util = {
    */
   uuid: {
     v4: function uuidV4() {
-      return __webpack_require__(898).v4();
+      return __webpack_require__(62).v4();
     }
   },
 
@@ -28995,17 +33117,33 @@ var util = {
         filename: process.env[util.sharedConfigFileEnv]
       });
     }
-    var profilesFromCreds = iniLoader.loadFrom({
-      filename: filename ||
-        (process.env[util.configOptInEnv] && process.env[util.sharedCredentialsFileEnv])
-    });
+    var profilesFromCreds= {};
+    try {
+      var profilesFromCreds = iniLoader.loadFrom({
+        filename: filename ||
+          (process.env[util.configOptInEnv] && process.env[util.sharedCredentialsFileEnv])
+      });
+    } catch (error) {
+      // if using config, assume it is fully descriptive without a credentials file:
+      if (!process.env[util.configOptInEnv]) throw error;
+    }
     for (var i = 0, profileNames = Object.keys(profilesFromConfig); i < profileNames.length; i++) {
-      profiles[profileNames[i]] = profilesFromConfig[profileNames[i]];
+      profiles[profileNames[i]] = objectAssign(profiles[profileNames[i]] || {}, profilesFromConfig[profileNames[i]]);
     }
     for (var i = 0, profileNames = Object.keys(profilesFromCreds); i < profileNames.length; i++) {
-      profiles[profileNames[i]] = profilesFromCreds[profileNames[i]];
+      profiles[profileNames[i]] = objectAssign(profiles[profileNames[i]] || {}, profilesFromCreds[profileNames[i]]);
     }
     return profiles;
+
+    /**
+     * Roughly the semantics of `Object.assign(target, source)`
+     */
+    function objectAssign(target, source) {
+      for (var i = 0, keys = Object.keys(source); i < keys.length; i++) {
+        target[keys[i]] = source[keys[i]];
+      }
+      return target;
+    }
   },
 
   /**
@@ -29075,7 +33213,51 @@ module.exports = util;
 /* 957 */,
 /* 958 */,
 /* 959 */,
-/* 960 */,
+/* 960 */
+/***/ (function(__unusedmodule, exports, __webpack_require__) {
+
+"use strict";
+
+
+Object.defineProperty(exports, "__esModule", {
+  value: true
+});
+exports.default = void 0;
+
+var _validate = _interopRequireDefault(__webpack_require__(634));
+
+function _interopRequireDefault(obj) { return obj && obj.__esModule ? obj : { default: obj }; }
+
+/**
+ * Convert array of 16 byte values to UUID string format of the form:
+ * XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+ */
+const byteToHex = [];
+
+for (let i = 0; i < 256; ++i) {
+  byteToHex.push((i + 0x100).toString(16).substr(1));
+}
+
+function stringify(arr, offset = 0) {
+  // Note: Be careful editing this code!  It's been tuned for performance
+  // and works in ways you may not expect. See https://github.com/uuidjs/uuid/pull/434
+  const uuid = (byteToHex[arr[offset + 0]] + byteToHex[arr[offset + 1]] + byteToHex[arr[offset + 2]] + byteToHex[arr[offset + 3]] + '-' + byteToHex[arr[offset + 4]] + byteToHex[arr[offset + 5]] + '-' + byteToHex[arr[offset + 6]] + byteToHex[arr[offset + 7]] + '-' + byteToHex[arr[offset + 8]] + byteToHex[arr[offset + 9]] + '-' + byteToHex[arr[offset + 10]] + byteToHex[arr[offset + 11]] + byteToHex[arr[offset + 12]] + byteToHex[arr[offset + 13]] + byteToHex[arr[offset + 14]] + byteToHex[arr[offset + 15]]).toLowerCase(); // Consistency check for valid UUID.  If this throws, it's likely due to one
+  // of the following:
+  // - One or more input array values don't map to a hex octet (leading to
+  // "undefined" in the uuid)
+  // - Invalid input values for the RFC `version` or `variant` fields
+
+  if (!(0, _validate.default)(uuid)) {
+    throw TypeError('Stringified UUID is invalid');
+  }
+
+  return uuid;
+}
+
+var _default = stringify;
+exports.default = _default;
+
+/***/ }),
 /* 961 */,
 /* 962 */
 /***/ (function(__unusedmodule, exports, __webpack_require__) {
@@ -29124,6 +33306,12 @@ function Operation(name, operation, options) {
       (operation.endpointdiscovery.required ? 'REQUIRED' : 'OPTIONAL') :
     'NULL'
   );
+
+  // httpChecksum replaces usage of httpChecksumRequired, but some APIs
+  // (s3control) still uses old trait.
+  var httpChecksumRequired = operation.httpChecksumRequired
+    || (operation.httpChecksum && operation.httpChecksum.requestChecksumRequired);
+  property(this, 'httpChecksumRequired', httpChecksumRequired, false);
 
   memoizedProperty(this, 'input', function() {
     if (!operation.input) {
@@ -29222,7 +33410,13 @@ module.exports = Operation;
  * Escapes characters that can not be in an XML element.
  */
 function escapeElement(value) {
-    return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return value.replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/\r/g, '&#x0D;')
+                .replace(/\n/g, '&#x0A;')
+                .replace(/\u0085/g, '&#x85;')
+                .replace(/\u2028/, '&#x2028;');
 }
 
 /**
@@ -29238,7 +33432,7 @@ module.exports = {
 /***/ (function(__unusedmodule, __unusedexports, __webpack_require__) {
 
 var AWS = __webpack_require__(395);
-var STS = __webpack_require__(733);
+var STS = __webpack_require__(106);
 
 /**
  * Represents credentials retrieved from STS SAML support.
@@ -29400,8 +33594,9 @@ AWS.ParamValidator = AWS.util.inherit({
   },
 
   validateStructure: function validateStructure(shape, params, context) {
-    this.validateType(params, context, ['object'], 'structure');
+    if (shape.isDocument) return true;
 
+    this.validateType(params, context, ['object'], 'structure');
     var paramName;
     for (var i = 0; shape.required && i < shape.required.length; i++) {
       paramName = shape.required[i];
@@ -29422,7 +33617,7 @@ AWS.ParamValidator = AWS.util.inherit({
       if (memberShape !== undefined) {
         var memberContext = [context, paramName].join('.');
         this.validateMember(memberShape, paramValue, memberContext);
-      } else {
+      } else if (paramValue !== undefined && paramValue !== null) {
         this.fail('UnexpectedParameter',
           'Unexpected key \'' + paramName + '\' found in ' + context);
       }
@@ -29745,7 +33940,7 @@ AWS.ProcessCredentials = AWS.util.inherit(AWS.Credentials, {
   * @throws ProcessCredentialsProviderFailure
   */
   loadViaCredentialProcess: function loadViaCredentialProcess(profile, callback) {
-    proc.exec(profile['credential_process'], function(err, stdOut, stdErr) {
+    proc.exec(profile['credential_process'], { env: process.env }, function(err, stdOut, stdErr) {
       if (err) {
         callback(AWS.util.error(
           new Error('credential_process returned error'),
@@ -30289,7 +34484,105 @@ function getSettings(settingsOrOptions = {}) {
 /* 993 */,
 /* 994 */,
 /* 995 */,
-/* 996 */,
+/* 996 */
+/***/ (function(module, __unusedexports, __webpack_require__) {
+
+var util = __webpack_require__(395).util;
+var toBuffer = util.buffer.toBuffer;
+
+/**
+ * A lossless representation of a signed, 64-bit integer. Instances of this
+ * class may be used in arithmetic expressions as if they were numeric
+ * primitives, but the binary representation will be preserved unchanged as the
+ * `bytes` property of the object. The bytes should be encoded as big-endian,
+ * two's complement integers.
+ * @param {Buffer} bytes
+ *
+ * @api private
+ */
+function Int64(bytes) {
+    if (bytes.length !== 8) {
+        throw new Error('Int64 buffers must be exactly 8 bytes');
+    }
+    if (!util.Buffer.isBuffer(bytes)) bytes = toBuffer(bytes);
+
+    this.bytes = bytes;
+}
+
+/**
+ * @param {number} number
+ * @returns {Int64}
+ *
+ * @api private
+ */
+Int64.fromNumber = function(number) {
+    if (number > 9223372036854775807 || number < -9223372036854775808) {
+        throw new Error(
+            number + ' is too large (or, if negative, too small) to represent as an Int64'
+        );
+    }
+
+    var bytes = new Uint8Array(8);
+    for (
+        var i = 7, remaining = Math.abs(Math.round(number));
+        i > -1 && remaining > 0;
+        i--, remaining /= 256
+    ) {
+        bytes[i] = remaining;
+    }
+
+    if (number < 0) {
+        negate(bytes);
+    }
+
+    return new Int64(bytes);
+};
+
+/**
+ * @returns {number}
+ *
+ * @api private
+ */
+Int64.prototype.valueOf = function() {
+    var bytes = this.bytes.slice(0);
+    var negative = bytes[0] & 128;
+    if (negative) {
+        negate(bytes);
+    }
+
+    return parseInt(bytes.toString('hex'), 16) * (negative ? -1 : 1);
+};
+
+Int64.prototype.toString = function() {
+    return String(this.valueOf());
+};
+
+/**
+ * @param {Buffer} bytes
+ *
+ * @api private
+ */
+function negate(bytes) {
+    for (var i = 0; i < 8; i++) {
+        bytes[i] ^= 0xFF;
+    }
+    for (var i = 7; i > -1; i--) {
+        bytes[i]++;
+        if (bytes[i] !== 0) {
+            break;
+        }
+    }
+}
+
+/**
+ * @api private
+ */
+module.exports = {
+    Int64: Int64
+};
+
+
+/***/ }),
 /* 997 */,
 /* 998 */,
 /* 999 */
