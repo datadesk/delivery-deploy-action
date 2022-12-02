@@ -15,14 +15,14 @@ steps:
   # Before you can upload, you need to log in to Amazon
   - uses: aws-actions/configure-aws-credentials@v1
     with:
-      aws-access-key-id: ${{ secrets.BAKER_AWS_ACCESS_KEY_ID }}
-      aws-secret-access-key: ${{ secrets.BAKER_AWS_SECRET_ACCESS_KEY }}
-      aws-region: ${{ secrets.BAKER_AWS_S3_PRODUCTION_REGION }}
+      aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      aws-region: ${{ secrets.AWS_S3_REGION }}
 
   # Here we do the upload to a public folder
   - uses: datadesk/delivery-deploy-action@v1
     with:
-      bucket: ${{ secrets.BAKER_AWS_S3_PRODUCTION_BUCKET }}
+      bucket: ${{ secrets.AWS_S3_PBUCKET }}
       dir: _dist
       public: true
 ```
